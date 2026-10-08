@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FF5A36"/>
+      <stop offset="1" stop-color="#E50914"/>
+    </linearGradient>
+  </defs>
+  <!-- ring of the "q" -->
+  <path fill="url(#g)" fill-rule="evenodd"
+        d="M46 5a41 41 0 1 1 0 82a41 41 0 1 1 0-82zM46 19a27 27 0 1 0 0 54a27 27 0 1 0 0-54z"/>
+  <!-- tail -->
+  <path fill="url(#g)" d="M63 76l13-13l20 20a4 4 0 0 1 0 5.7l-7.3 7.3a4 4 0 0 1-5.7 0z"/>
+  <!-- play button -->
+  <path fill="#FFFFFF" d="M38 31.5v29a2 2 0 0 0 3 1.7l23-14.5a2 2 0 0 0 0-3.4l-23-14.5a2 2 0 0 0-3 1.7z"/>
+</svg>

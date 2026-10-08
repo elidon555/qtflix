@@ -1,0 +1,12 @@
+# build output
+build*/
+compile_commands.json
+
+# editors / IDEs
+*.user
+*.user.*
+.qtcreator/
+.vscode/
+.idea/
+*.swp
+.DS_Store

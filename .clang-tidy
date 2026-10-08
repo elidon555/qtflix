@@ -1,0 +1,14 @@
+# clang-tidy config for qtflix. Run with: ninja -C build lint
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  performance-*,
+  readability-container-size-empty,
+  readability-redundant-string-cstr,
+  modernize-use-nullptr,
+  modernize-use-override,
+  modernize-loop-convert,
+  misc-unused-using-decls
+WarningsAsErrors: ''
+HeaderFilterRegex: 'src/.*'
