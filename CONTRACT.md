@@ -56,3 +56,27 @@ subdirectories). Assets live in `assets/` and are available as `qrc:/assets/<fil
   inserts/removes/moves, `featuredChanged` only when the hero's data changed, `libraryChanged` only when something
   changed or after the first scan of a session). Dev env: `QTFLIX_TIMING=1` (startup/scan/thumbnail timings),
   `QTFLIX_HWACCEL=0` (no VA-API frame grabs), `QTFLIX_NO_WARMUP=1` (no thumbnail pre-generation).
+
+## Performance pass (backend)
+- New TitleModel role `isRecent` (bool): `added` is less than 7 days ago (same rule as `Theme.isRecent`). Also a key of
+  `TitleModel.get()` / `Library.title()` / `Library.featured` maps.
+- `Library.recentTitles(n)` -> up to n title maps (same keys as `title()`), newest `added` first (ties: alphabetical).
+- `Library.recentCount()` -> number of titles with `isRecent`. Plain invokables: re-query on `libraryChanged`.
+- `Library.episodeCount(id, season)` -> `episodes(id, season).length` without building the maps.
+- `Library.warmSeason(id, season)`: pre-generates that season's episode stills in the background (behind live image
+  requests). Call when the detail modal shows a season; repeated calls are no-ops. The scan warm-up no longer queues
+  episode stills or portrait `card` images (the `cardImage` role stays) — only backdrops.
+- `Library.flushProgress()`: writes pending watch state now (async). `setProgress()` updates the models at once but the
+  file is written at most every ~30 s, on `flushProgress()`, and synchronously on quit. The player should call
+  `flushProgress()` when it closes / stops.
+- Library / TitleModel Q_PROPERTYs are FINAL.
+- Episode `thumb` / `still` URLs may carry `?v=<n>` like `cardImage` / `backdropImage` (new generation = refetch).
+- First scan is progressive: titles appear right after the folder walk (durations / quality / 4K badge fill in as
+  ffprobe results arrive, in batches every ~1.5 s); frames of files not probed yet are placeholders and their image
+  URLs change (`?v=`) once probed. `libraryChanged` fires on the first publish and when titles are added / removed.
+- Auto-rescans read only the folders the watcher reported (plus new subfolders); manual `rescan()`, folder changes and
+  the first scan of a session read everything. Metadata overlay refreshes are coalesced (250 ms).
+- C++ only (metadata service): `Library::setWarmUpSkip(std::function<bool(const QString &id)>)` (warm-up skips frame
+  grabs of those titles) and slot `Library::requeueWarmUp()` (rebuild the warm-up list after the answer changed).
+- Dev: `QTFLIX_SELFTEST=progress` (run twice, headless) checks progress saving / restoring; `QTFLIX_TIMING=1` adds
+  "first titles published", scan breakdown (walk / folders read / files probed) and warm-up job counts.

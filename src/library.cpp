@@ -17,7 +17,7 @@
 #include <QProcess>
 #include <QRandomGenerator>
 #include <QRegularExpression>
-#include <QSaveFile>
+#include <QSemaphore>
 #include <QSet>
 #include <QSettings>
 #include <QStandardPaths>
@@ -25,6 +25,8 @@
 #include <QTimer>
 #include <QUrl>
 #include <algorithm>
+#include <cstdio>
+#include <unistd.h>
 
 // =====================================================================================================
 //  Filename parsing (pure functions, run on the scan thread)
@@ -65,6 +67,11 @@ struct ScanInfo {
     int unstable = 0;     // files skipped because they are still being written
     int rejected = 0;     // unreadable / not a video / ffprobe error
     qint64 ms = 0;
+    qint64 walkMs = 0, probeMs = 0;
+    int totalDirs = 0;    // folders walked
+    int listedDirs = 0;   // ... of which read from disk (the rest re-used the last listing)
+    QStringList newDirs;  // folders read for the first time by an incremental scan
+    int probed = 0;       // files run through ffprobe
 };
 constexpr int kMaxWatchedDirs = 500;
 
@@ -480,59 +487,7 @@ QString cachePath(const QString &file)
     return dir + QLatin1Char('/') + file;
 }
 
-// ---------------------------------------------------------------------------------- directory walk
-
-struct FoundFile {
-    QString path;   // absolute
-    QString root;   // configured folder containing it
-    QFileInfo info;
-};
-
-void collectVideos(const QString &dir, const QString &root, QSet<QString> &visitedDirs, QSet<QString> &seenFiles,
-                   QVector<FoundFile> &out, int depth, ScanInfo *info)
-{
-    if (depth > 20)
-        return;
-    if (info && info->dirs.size() < kMaxWatchedDirs)
-        info->dirs << dir;
-    QDir d(dir);
-    const QFileInfoList entries = d.entryInfoList(QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot | QDir::Readable,
-                                                  QDir::Name);
-    for (const QFileInfo &fi : entries) {
-        if (fi.fileName().startsWith(QLatin1Char('.')))
-            continue;
-        if (fi.isDir()) {
-            const QString canon = fi.canonicalFilePath();
-            if (canon.isEmpty() || visitedDirs.contains(canon))
-                continue;
-            visitedDirs.insert(canon);
-            collectVideos(fi.absoluteFilePath(), root, visitedDirs, seenFiles, out, depth + 1, info);
-        } else if (fi.isFile() && videoExtensions().contains(fi.suffix().toLower())) {
-            if (fi.size() <= 0)
-                continue;
-            if (!fi.isReadable()) {
-                if (info) ++info->rejected;
-                continue;
-            }
-            // still being copied / downloaded: skip until it settles (the caller schedules a rescan)
-            if (std::llabs(fi.lastModified().msecsTo(QDateTime::currentDateTime())) < 5000) {
-                if (info) ++info->unstable;
-                continue;
-            }
-            static const QRegularExpression sample(QStringLiteral("(?<![A-Za-z0-9])sample(?![A-Za-z0-9])"),
-                                                   QRegularExpression::CaseInsensitiveOption);
-            if (fi.size() < 300LL * 1024 * 1024 && sample.match(fi.completeBaseName()).hasMatch())
-                continue;
-            const QString canon = fi.canonicalFilePath();
-            if (canon.isEmpty() || seenFiles.contains(canon))
-                continue;
-            seenFiles.insert(canon);
-            out.append({fi.absoluteFilePath(), root, fi});
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------------- ffprobe
+// ---------------------------------------------------------------------------------- probe results
 
 struct Probe {
     QString path;
@@ -546,7 +501,134 @@ struct Probe {
     bool bad = false;      // ffprobe rejected the file (not a media file / corrupt)
     bool video = true;     // has a video stream
     bool unstable = false; // size changed while probing
+    bool probed = true;    // false: not probed yet (provisional values of a progressive first scan)
 };
+
+// ---------------------------------------------------------------------------------- directory walk
+
+const QStringList &artworkExtensions()
+{
+    static const QStringList l = {"jpg", "jpeg", "png", "webp"};
+    return l;
+}
+
+// One directory as read from disk. Rescans re-use the listings of directories the folder watcher did not
+// report, so an auto-rescan only reads the folders that changed.
+struct DirListing {
+    QString canon;            // canonical path of the directory itself
+    QFileInfoList entries;    // subdirectories and video files (not hidden), by name
+    QSet<QString> images;     // artwork candidates (jpg/jpeg/png/webp) by exact file name
+    bool volatileDir = false; // held a file that was still being written: always read again
+};
+using DirCache = QHash<QString, DirListing>; // absolute path as reached by the walk -> listing
+
+// Scan state kept between the scans of one session (owned by the Library, used by one scan at a time).
+struct ScanMemoryData {
+    DirCache dirs;                 // listings of the last walk
+    QHash<QString, Probe> probes;  // probe cache (mirrors probe-cache.json)
+    bool probesLoaded = false;
+};
+
+DirListing listDir(const QString &dir, const QString &canon)
+{
+    DirListing l;
+    l.canon = canon;
+    const QFileInfoList entries = QDir(dir).entryInfoList(QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot | QDir::Readable,
+                                                          QDir::Name);
+    for (const QFileInfo &fi : entries) {
+        const QString name = fi.fileName();
+        if (name.startsWith(QLatin1Char('.')))
+            continue;
+        if (fi.isDir()) {
+            l.entries << fi;
+        } else if (fi.isFile()) {
+            const QString ext = fi.suffix().toLower();
+            if (videoExtensions().contains(ext))
+                l.entries << fi;
+            else if (artworkExtensions().contains(ext))
+                l.images.insert(name);
+        }
+    }
+    return l;
+}
+
+struct FoundFile {
+    QString path;   // absolute
+    QString root;   // configured folder containing it
+    QFileInfo info;
+};
+
+struct Walk {
+    const DirCache *old = nullptr; // listings of the previous walk (empty: read everything)
+    QSet<QString> dirty;           // folders to read again although listed before
+    DirCache next;                 // listings of this walk
+    QSet<QString> visitedDirs, seenFiles;
+    QVector<FoundFile> out;
+    QStringList newDirs;           // read for the first time although `old` was not empty
+    int listed = 0;                // folders read from disk
+    QDateTime now;
+    ScanInfo *info = nullptr;
+};
+
+QString childPath(const QString &canonDir, const QString &name)
+{
+    return canonDir.endsWith(QLatin1Char('/')) ? canonDir + name : canonDir + QLatin1Char('/') + name;
+}
+
+// Canonical paths are derived from the parent's (only symlinks are resolved), so the walk costs one
+// directory read per folder instead of a realpath() per entry.
+void collectVideos(Walk &w, const QString &dir, const QString &canon, const QString &root, int depth)
+{
+    if (depth > 20)
+        return;
+    if (w.info->dirs.size() < kMaxWatchedDirs)
+        w.info->dirs << dir;
+    ++w.info->totalDirs;
+    DirListing l;
+    const auto cached = w.old->constFind(dir);
+    if (cached != w.old->cend() && !cached->volatileDir && cached->canon == canon && !w.dirty.contains(dir)) {
+        l = cached.value();
+    } else {
+        if (cached == w.old->cend() && !w.old->isEmpty())
+            w.newDirs << dir;
+        l = listDir(dir, canon);
+        ++w.listed;
+    }
+    for (const QFileInfo &fi : std::as_const(l.entries)) {
+        if (fi.isDir()) {
+            const QString c = fi.isSymLink() ? fi.canonicalFilePath() : childPath(canon, fi.fileName());
+            if (c.isEmpty() || w.visitedDirs.contains(c))
+                continue;
+            w.visitedDirs.insert(c);
+            collectVideos(w, fi.absoluteFilePath(), c, root, depth + 1);
+            continue;
+        }
+        if (fi.size() <= 0)
+            continue;
+        if (!fi.isReadable()) {
+            ++w.info->rejected;
+            continue;
+        }
+        // still being copied / downloaded: skip until it settles (the caller schedules a rescan)
+        if (std::llabs(fi.lastModified().msecsTo(w.now)) < 5000) {
+            ++w.info->unstable;
+            l.volatileDir = true;
+            continue;
+        }
+        static const QRegularExpression sample(QStringLiteral("(?<![A-Za-z0-9])sample(?![A-Za-z0-9])"),
+                                               QRegularExpression::CaseInsensitiveOption);
+        if (fi.size() < 300LL * 1024 * 1024 && sample.match(fi.completeBaseName()).hasMatch())
+            continue;
+        const QString c = fi.isSymLink() ? fi.canonicalFilePath() : childPath(canon, fi.fileName());
+        if (c.isEmpty() || w.seenFiles.contains(c))
+            continue;
+        w.seenFiles.insert(c);
+        w.out.append({fi.absoluteFilePath(), root, fi});
+    }
+    w.next.insert(dir, l);
+}
+
+// ---------------------------------------------------------------------------------- ffprobe
 
 void runProbe(Probe &p, const QString &exe)
 {
@@ -586,87 +668,74 @@ void runProbe(Probe &p, const QString &exe)
     p.ok = true;
 }
 
-QHash<QString, Probe> probeAll(const QVector<FoundFile> &files)
+// Almost all of an ffprobe run is process start-up (~30 ms, independent of -probesize / -analyzeduration on
+// local files), so throughput comes from running several at once.
+int probeThreads()
 {
-    const QString cacheFile = cachePath(QStringLiteral("probe-cache.json"));
-    QJsonObject cache;
-    {
-        QFile f(cacheFile);
-        if (f.open(QIODevice::ReadOnly))
-            cache = QJsonDocument::fromJson(f.readAll()).object();
+    return std::clamp(QThread::idealThreadCount(), 2, 8);
+}
+
+// Writes `data` to a temp file next to `path` and renames it over `path` (atomic replace, no fsync).
+// Callers serialize writes per file.
+bool writeFileAtomic(const QString &path, const QByteArray &data)
+{
+    const QString tmp = path + QStringLiteral(".tmp-%1").arg(QCoreApplication::applicationPid());
+    QFile f(tmp);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+    const bool ok = f.write(data) == data.size();
+    f.close();
+    if (!ok || std::rename(QFile::encodeName(tmp).constData(), QFile::encodeName(path).constData()) != 0) {
+        QFile::remove(tmp);
+        return false;
     }
-    QVector<Probe> probes;
-    probes.reserve(files.size());
-    for (const FoundFile &ff : files) {
+    return true;
+}
+
+void loadProbeCache(ScanMemoryData &mem)
+{
+    mem.probesLoaded = true;
+    QFile f(cachePath(QStringLiteral("probe-cache.json")));
+    if (!f.open(QIODevice::ReadOnly))
+        return;
+    const QJsonObject cache = QJsonDocument::fromJson(f.readAll()).object();
+    mem.probes.reserve(cache.size());
+    for (auto it = cache.begin(); it != cache.end(); ++it) {
+        const QJsonObject c = it.value().toObject();
         Probe p;
-        p.path = ff.path;
-        p.mtime = ff.info.lastModified().toMSecsSinceEpoch();
-        p.size = ff.info.size();
-        const QJsonObject c = cache.value(ff.path).toObject();
-        if (!c.isEmpty() && qint64(c.value(QStringLiteral("m")).toDouble()) == p.mtime
-            && qint64(c.value(QStringLiteral("s")).toDouble()) == p.size) {
-            p.durationMs = qint64(c.value(QStringLiteral("d")).toDouble());
-            p.width = c.value(QStringLiteral("w")).toInt();
-            p.height = c.value(QStringLiteral("h")).toInt();
-            p.codec = c.value(QStringLiteral("c")).toString();
-            p.bad = c.value(QStringLiteral("b")).toBool();
-            p.video = c.value(QStringLiteral("v")).toBool(true);
-            p.cached = true;
-            p.ok = !p.bad;
-        }
-        probes.append(p);
+        p.path = it.key();
+        p.mtime = qint64(c.value(QStringLiteral("m")).toDouble());
+        p.size = qint64(c.value(QStringLiteral("s")).toDouble());
+        p.durationMs = qint64(c.value(QStringLiteral("d")).toDouble());
+        p.width = c.value(QStringLiteral("w")).toInt();
+        p.height = c.value(QStringLiteral("h")).toInt();
+        p.codec = c.value(QStringLiteral("c")).toString();
+        p.bad = c.value(QStringLiteral("b")).toBool();
+        p.video = c.value(QStringLiteral("v")).toBool(true);
+        p.cached = true;
+        p.ok = !p.bad;
+        mem.probes.insert(p.path, p);
     }
+}
 
-    const QString exe = QStandardPaths::findExecutable(QStringLiteral("ffprobe"));
-    bool anyNew = false;
-    if (!exe.isEmpty()) {
-        QVector<Probe *> todo;
-        for (Probe &p : probes)
-            if (!p.cached)
-                todo.append(&p);
-        if (!todo.isEmpty()) {
-            QThreadPool pool;
-            pool.setMaxThreadCount(4);
-            QtConcurrent::blockingMap(&pool, todo, [&exe](Probe *p) { runProbe(*p, exe); });
-            anyNew = true;
-            // a file whose size changed while we probed it is still being written
-            for (Probe *p : std::as_const(todo))
-                if (QFileInfo(p->path).size() != p->size)
-                    p->unstable = true;
-        }
-    }
-
-    QHash<QString, Probe> result;
-    QJsonObject newCache;
+void saveProbeCache(const QHash<QString, Probe> &probes)
+{
+    QJsonObject cache;
     for (const Probe &p : probes) {
-        result.insert(p.path, p);
-        if ((p.ok || p.bad) && !p.unstable) {
-            QJsonObject c;
-            c.insert(QStringLiteral("m"), double(p.mtime));
-            c.insert(QStringLiteral("s"), double(p.size));
-            c.insert(QStringLiteral("d"), double(p.durationMs));
-            c.insert(QStringLiteral("w"), p.width);
-            c.insert(QStringLiteral("h"), p.height);
-            c.insert(QStringLiteral("c"), p.codec);
-            if (p.bad)
-                c.insert(QStringLiteral("b"), true);
-            if (!p.video)
-                c.insert(QStringLiteral("v"), false);
-            newCache.insert(p.path, c);
-        }
+        QJsonObject c;
+        c.insert(QStringLiteral("m"), double(p.mtime));
+        c.insert(QStringLiteral("s"), double(p.size));
+        c.insert(QStringLiteral("d"), double(p.durationMs));
+        c.insert(QStringLiteral("w"), p.width);
+        c.insert(QStringLiteral("h"), p.height);
+        c.insert(QStringLiteral("c"), p.codec);
+        if (p.bad)
+            c.insert(QStringLiteral("b"), true);
+        if (!p.video)
+            c.insert(QStringLiteral("v"), false);
+        cache.insert(p.path, c);
     }
-    // keep entries of files outside the current folders too (folder may be re-added later), but cap size
-    if (anyNew || newCache.size() != cache.size()) {
-        for (auto it = cache.begin(); it != cache.end() && newCache.size() < 20000; ++it)
-            if (!newCache.contains(it.key()) && QFileInfo::exists(it.key()))
-                newCache.insert(it.key(), it.value());
-        QSaveFile f(cacheFile);
-        if (f.open(QIODevice::WriteOnly)) {
-            f.write(QJsonDocument(newCache).toJson(QJsonDocument::Compact));
-            f.commit();
-        }
-    }
-    return result;
+    writeFileAtomic(cachePath(QStringLiteral("probe-cache.json")), QJsonDocument(cache).toJson(QJsonDocument::Compact));
 }
 
 // ---------------------------------------------------------------------------------- grouping
@@ -788,17 +857,18 @@ ParsedFile parseFile(const FoundFile &ff)
     return pf;
 }
 
-QString findArtwork(const QStringList &dirs, const QStringList &baseNames)
+// artwork lookup against the directory listings of the walk (falls back to the disk for unlisted folders)
+QString findArtwork(const DirCache &listings, const QStringList &dirs, const QStringList &baseNames)
 {
-    static const QStringList exts = {"jpg", "jpeg", "png", "webp"};
     for (const QString &d : dirs) {
         if (d.isEmpty())
             continue;
+        const auto l = listings.constFind(d);
         for (const QString &b : baseNames)
-            for (const QString &e : exts) {
-                const QString p = d + QLatin1Char('/') + b + QLatin1Char('.') + e;
-                if (QFileInfo::exists(p))
-                    return p;
+            for (const QString &e : artworkExtensions()) {
+                const QString name = b + QLatin1Char('.') + e;
+                if (l != listings.cend() ? l->images.contains(name) : QFileInfo::exists(d + QLatin1Char('/') + name))
+                    return d + QLatin1Char('/') + name;
             }
     }
     return {};
@@ -932,60 +1002,29 @@ bool episodeLess(const MediaFile &a, const MediaFile &b)
     return QString::compare(a.path, b.path, Qt::CaseInsensitive) < 0;
 }
 
-QVector<Title> scanFolders(const QStringList &folders, ScanInfo *info)
+// Groups parsed files into titles. `parsedAll` is sorted by path (case-insensitive); files whose probe says
+// "not a video" / broken / still growing are left out (counted in `info` when given).
+QVector<Title> buildTitles(const QVector<ParsedFile> &parsedAll, const QHash<QString, Probe> &probes,
+                           const DirCache &listings, ScanInfo *info)
 {
-    QElapsedTimer timer;
-    timer.start();
-    // 1) walk (deepest configured roots first so they claim their files)
-    QStringList roots;
-    for (const QString &f : folders) {
-        const QString c = QDir::cleanPath(f);
-        if (QFileInfo(c).isDir() && !roots.contains(c))
-            roots << c;
-    }
-    std::sort(roots.begin(), roots.end(), [](const QString &a, const QString &b) { return a.size() > b.size(); });
-    QSet<QString> visitedDirs, seenFiles;
-    QVector<FoundFile> found;
-    for (const QString &r : roots) {
-        const QString canon = QFileInfo(r).canonicalFilePath();
-        if (canon.isEmpty() || visitedDirs.contains(canon))
-            continue;
-        visitedDirs.insert(canon);
-        collectVideos(r, r, visitedDirs, seenFiles, found, 0, info);
-    }
-
-    // 2) probe; drop files that are not videos, broken, or still growing
-    const QHash<QString, Probe> probes = probeAll(found);
-    found.removeIf([&](const FoundFile &ff) {
-        const Probe p = probes.value(ff.path);
-        if (p.unstable) {
-            ++info->unstable;
-            return true;
-        }
-        if (p.bad || (p.ok && !p.video)) {
-            ++info->rejected;
-            return true;
-        }
-        return false;
-    });
-
-    // 3) parse
     QVector<ParsedFile> parsed;
-    parsed.reserve(found.size());
-    for (const FoundFile &ff : found)
-        parsed.append(parseFile(ff));
+    parsed.reserve(parsedAll.size());
+    for (const ParsedFile &pf : parsedAll) {
+        const auto p = probes.constFind(pf.ff.path);
+        if (p != probes.cend() && p->unstable) {
+            if (info) ++info->unstable;
+            continue;
+        }
+        if (p != probes.cend() && (p->bad || (p->ok && !p->video))) {
+            if (info) ++info->rejected;
+            continue;
+        }
+        parsed.append(pf);
+    }
 
     // series folders known from real episodes -> featurettes / extras inside them join the series
     QHash<QString, int> seriesDirOwner; // dir -> index of an episode file
-    for (int i = 0; i < parsed.size(); ++i)
-        if (parsed[i].isEpisode && !parsed[i].seriesDir.isEmpty() && !seriesDirOwner.contains(parsed[i].seriesDir))
-            seriesDirOwner.insert(parsed[i].seriesDir, i);
     QHash<QString, int> extraCounter;
-    std::sort(parsed.begin(), parsed.end(), [](const ParsedFile &a, const ParsedFile &b) {
-        return QString::compare(a.ff.path, b.ff.path, Qt::CaseInsensitive) < 0;
-    });
-    // indices changed after the sort: rebuild owner map
-    seriesDirOwner.clear();
     for (int i = 0; i < parsed.size(); ++i)
         if (parsed[i].isEpisode && !parsed[i].seriesDir.isEmpty() && !seriesDirOwner.contains(parsed[i].seriesDir))
             seriesDirOwner.insert(parsed[i].seriesDir, i);
@@ -1048,11 +1087,14 @@ QVector<Title> scanFolders(const QStringList &folders, ScanInfo *info)
         mf.season = pf.isEpisode ? pf.season : 0;
         mf.episode = pf.isEpisode ? pf.episode : 0;
         mf.episodeTitle = pf.episodeTitle;
-        const Probe pr = probes.value(pf.ff.path);
-        mf.durationMs = pr.durationMs;
-        mf.width = pr.width;
-        mf.height = pr.height;
-        mf.videoCodec = pr.codec;
+        const auto pr = probes.constFind(pf.ff.path);
+        if (pr != probes.cend()) {
+            mf.durationMs = pr->durationMs;
+            mf.width = pr->width;
+            mf.height = pr->height;
+            mf.videoCodec = pr->codec;
+            mf.probed = pr->probed;
+        }
         mf.modified = pf.ff.info.lastModified();
         return mf;
     };
@@ -1107,16 +1149,16 @@ QVector<Title> scanFolders(const QStringList &folders, ScanInfo *info)
         if (fileDir != seriesDir && QDir::cleanPath(fileDir) != QDir::cleanPath(root))
             artDirs << fileDir;
         if (!seriesDir.isEmpty()) {
-            t.posterFile = findArtwork(artDirs, {"poster", "folder", "cover", "show"});
-            t.backdropFile = findArtwork(artDirs, {"fanart", "backdrop", "background"});
+            t.posterFile = findArtwork(listings, artDirs, {"poster", "folder", "cover", "show"});
+            t.backdropFile = findArtwork(listings, artDirs, {"fanart", "backdrop", "background"});
         }
         if (t.posterFile.isEmpty()) {
             const QString stem = QFileInfo(t.files.first().path).completeBaseName();
-            t.posterFile = findArtwork({fileDir}, {stem + QStringLiteral("-poster"), stem});
+            t.posterFile = findArtwork(listings, {fileDir}, {stem + QStringLiteral("-poster"), stem});
         }
         if (t.backdropFile.isEmpty()) {
             const QString stem = QFileInfo(t.files.first().path).completeBaseName();
-            t.backdropFile = findArtwork({fileDir}, {stem + QStringLiteral("-fanart")});
+            t.backdropFile = findArtwork(listings, {fileDir}, {stem + QStringLiteral("-fanart")});
         }
         fillCosmetics(t, false, rootNameOf(root));
         fillDescription(t, false, rootNameOf(root));
@@ -1170,12 +1212,198 @@ QVector<Title> scanFolders(const QStringList &folders, ScanInfo *info)
             posterNames << QStringLiteral("poster") << QStringLiteral("folder") << QStringLiteral("cover");
             backdropNames << QStringLiteral("fanart") << QStringLiteral("backdrop") << QStringLiteral("background");
         }
-        t.posterFile = findArtwork({dir}, posterNames);
-        t.backdropFile = findArtwork({dir}, backdropNames);
+        t.posterFile = findArtwork(listings, {dir}, posterNames);
+        t.backdropFile = findArtwork(listings, {dir}, backdropNames);
         fillCosmetics(t, pf.recording, rootNameOf(pf.ff.root));
         fillDescription(t, pf.recording, rootNameOf(pf.ff.root));
         titles.append(t);
     }
+    return titles;
+}
+
+// What one scan is asked to do (built on the GUI thread).
+struct ScanJob {
+    QStringList folders;
+    bool full = true;              // read every folder (else re-use listings of folders not in `dirty`)
+    QSet<QString> dirty;           // folders the watcher reported since the last scan
+    QHash<QString, Title> known;   // titles of the last scan: provisional values for a progressive publish
+};
+using Publish = std::function<void(QVector<Title> &&)>;
+constexpr int kProgressiveMin = 24;   // unprobed files needed before titles are published ahead of ffprobe
+constexpr int kPublishEveryMs = 1500; // while probing, publish what arrived at most this often
+
+QVector<Title> scanFolders(const ScanJob &job, ScanMemoryData &mem, ScanInfo *info, const Publish &publish)
+{
+    QElapsedTimer timer;
+    timer.start();
+    // 1) walk (deepest configured roots first so they claim their files)
+    QStringList roots;
+    for (const QString &f : job.folders) {
+        const QString c = QDir::cleanPath(f);
+        if (QFileInfo(c).isDir() && !roots.contains(c))
+            roots << c;
+    }
+    std::sort(roots.begin(), roots.end(), [](const QString &a, const QString &b) { return a.size() > b.size(); });
+    const DirCache none;
+    Walk w;
+    w.old = job.full ? &none : &mem.dirs;
+    w.dirty = job.dirty;
+    w.now = QDateTime::currentDateTime();
+    w.info = info;
+    for (const QString &r : roots) {
+        const QString canon = QFileInfo(r).canonicalFilePath();
+        if (canon.isEmpty() || w.visitedDirs.contains(canon))
+            continue;
+        w.visitedDirs.insert(canon);
+        collectVideos(w, r, canon, r, 0);
+    }
+    mem.dirs = std::move(w.next);
+    info->listedDirs = w.listed;
+    info->newDirs = w.newDirs;
+    info->walkMs = timer.elapsed();
+
+    // 2) probe cache lookup
+    if (!mem.probesLoaded)
+        loadProbeCache(mem);
+    QHash<QString, Probe> probes;
+    probes.reserve(w.out.size());
+    QVector<Probe> todo;
+    for (const FoundFile &ff : std::as_const(w.out)) {
+        Probe p;
+        p.path = ff.path;
+        p.mtime = ff.info.lastModified().toMSecsSinceEpoch();
+        p.size = ff.info.size();
+        const auto c = mem.probes.constFind(ff.path);
+        if (c != mem.probes.cend() && c->mtime == p.mtime && c->size == p.size)
+            probes.insert(p.path, c.value());
+        else
+            todo.append(p);
+    }
+
+    // 3) parse once (grouping is redone for every published result)
+    QVector<ParsedFile> parsed;
+    parsed.reserve(w.out.size());
+    for (const FoundFile &ff : std::as_const(w.out))
+        parsed.append(parseFile(ff));
+    std::sort(parsed.begin(), parsed.end(), [](const ParsedFile &a, const ParsedFile &b) {
+        return QString::compare(a.ff.path, b.ff.path, Qt::CaseInsensitive) < 0;
+    });
+
+    // 4) probe new / changed files in parallel. Many of them (first scan, new folder): publish the titles
+    //    right away (durations of unchanged files from the last scan, else unknown) and then every 1.5 s.
+    const QString exe = todo.isEmpty() ? QString() : QStandardPaths::findExecutable(QStringLiteral("ffprobe"));
+    const bool progressive = publish && !exe.isEmpty() && todo.size() >= kProgressiveMin;
+    for (const Probe &p : std::as_const(todo)) {
+        Probe pending = p;
+        pending.probed = !progressive; // without ffprobe the zeros are final
+        probes.insert(p.path, pending);
+    }
+    if (progressive) {
+        QHash<QString, const MediaFile *> knownFiles;
+        for (const Title &t : job.known)
+            for (const MediaFile &f : t.files)
+                knownFiles.insert(f.path, &f);
+        for (const Probe &p : std::as_const(todo)) {
+            const MediaFile *f = knownFiles.value(p.path);
+            if (!f || f->modified.toMSecsSinceEpoch() != p.mtime)
+                continue;
+            Probe &q = probes[p.path];
+            q.durationMs = f->durationMs;
+            q.width = f->width;
+            q.height = f->height;
+            q.codec = f->videoCodec;
+        }
+        publish(buildTitles(parsed, probes, mem.dirs, nullptr));
+    }
+    bool cacheDirty = false;
+    if (!exe.isEmpty() && !todo.isEmpty()) {
+        QThreadPool pool;
+        pool.setMaxThreadCount(probeThreads());
+        QMutex doneMutex;
+        QVector<int> done;  // indices into todo, finished since the last publish
+        QSemaphore finishedSem;
+        Probe *base = todo.data();
+        for (int i = 0; i < todo.size(); ++i) {
+            pool.start([base, i, &exe, &doneMutex, &done, &finishedSem] {
+                Probe &p = base[i];
+                runProbe(p, exe);
+                // a file whose size changed while we probed it is still being written
+                if (QFileInfo(p.path).size() != p.size)
+                    p.unstable = true;
+                {
+                    QMutexLocker l(&doneMutex);
+                    done << i;
+                }
+                finishedSem.release();
+            });
+        }
+        int finished = 0;
+        QElapsedTimer sincePublish;
+        sincePublish.start();
+        while (finished < todo.size()) {
+            if (finishedSem.tryAcquire(1, 200))
+                ++finished;
+            if (!progressive || finished == todo.size() || sincePublish.elapsed() < kPublishEveryMs)
+                continue;
+            QVector<int> batch;
+            {
+                QMutexLocker l(&doneMutex);
+                batch.swap(done);
+            }
+            for (int i : std::as_const(batch))
+                probes.insert(todo.at(i).path, todo.at(i));
+            if (!batch.isEmpty())
+                publish(buildTitles(parsed, probes, mem.dirs, nullptr));
+            sincePublish.restart();
+        }
+        pool.waitForDone();
+        for (const Probe &p : std::as_const(todo)) {
+            probes.insert(p.path, p);
+            if (p.unstable) { // read its folder again next time
+                const auto l = mem.dirs.find(QFileInfo(p.path).absolutePath());
+                if (l != mem.dirs.end())
+                    l->volatileDir = true;
+            }
+        }
+        cacheDirty = true;
+        info->probed = int(todo.size());
+    }
+    info->probeMs = timer.elapsed() - info->walkMs;
+
+    // 5) probe cache: entries of files outside the scanned folders are kept (a folder may be re-added later);
+    //    inside them, the walk just showed which files still exist
+    QHash<QString, Probe> keep;
+    keep.reserve(probes.size());
+    for (const Probe &p : std::as_const(probes))
+        if ((p.ok || p.bad) && !p.unstable && p.probed)
+            keep.insert(p.path, p);
+    QStringList rootPrefixes;
+    for (const QString &r : std::as_const(roots))
+        rootPrefixes << (r.endsWith(QLatin1Char('/')) ? r : r + QLatin1Char('/'));
+    QVector<QString> outside;
+    for (auto it = mem.probes.cbegin(); it != mem.probes.cend(); ++it) {
+        if (keep.contains(it.key()))
+            continue;
+        const bool inside = std::any_of(rootPrefixes.cbegin(), rootPrefixes.cend(),
+                                        [&](const QString &r) { return it.key().startsWith(r); });
+        if (inside)
+            cacheDirty = true; // gone (or changed and not probed successfully)
+        else if (keep.size() + outside.size() < 20000)
+            outside << it.key();
+    }
+    if (cacheDirty) {
+        for (const QString &path : std::as_const(outside))
+            if (QFileInfo::exists(path))
+                keep.insert(path, mem.probes.value(path));
+        saveProbeCache(keep);
+    } else {
+        for (const QString &path : std::as_const(outside))
+            keep.insert(path, mem.probes.value(path));
+    }
+    mem.probes = std::move(keep);
+
+    // 6) group
+    const QVector<Title> titles = buildTitles(parsed, probes, mem.dirs, info);
     info->ms = timer.elapsed();
     return titles;
 }
@@ -1344,6 +1572,36 @@ const QStringList &overlayFileKeys()
 } // namespace
 
 struct Library::ScanExtras : ScanInfo {};
+struct Library::ScanMemory : ScanMemoryData {};
+struct Library::ScanResult {
+    enum Kind { OverlayCheck, Partial, Final } kind = Final;
+    QVector<Title> titles;
+    QSet<QString> brokenOverlays;               // OverlayCheck: titles whose restored overlays miss files
+    std::shared_ptr<Library::OverlayCheck> check;
+};
+
+namespace {
+constexpr int kProgressSaveMs = 30000; // playback progress ticks: watch state written at most this often
+constexpr int kStateSaveMs = 2000;     // explicit actions (my list, watched, cleared)
+constexpr int kCacheSaveMs = 1500;     // scan cache debounce ...
+constexpr int kCacheSaveMaxWaitMs = 10000; // ... but written at least this often while overlays stream in
+constexpr int kRefreshMs = 250;        // metadata overlays: model refreshes coalesced this long
+constexpr int kBulkRefresh = 50;       // more changed titles than this: one refreshAll() per model
+const QList<int> &progressRoles()
+{
+    static const QList<int> roles = {TitleModel::PathRole, TitleModel::SourceUrlRole, TitleModel::DurationMsRole,
+                                     TitleModel::PositionMsRole, TitleModel::ProgressRole};
+    return roles;
+}
+bool isRecentDate(const QDateTime &added, qint64 nowMs)
+{
+    return added.isValid() && nowMs - added.toMSecsSinceEpoch() < 7LL * 24 * 3600 * 1000;
+}
+bool hasUnprobed(const Title &t)
+{
+    return std::any_of(t.files.cbegin(), t.files.cend(), [](const MediaFile &f) { return !f.probed; });
+}
+} // namespace
 
 // =====================================================================================================
 //  Library
@@ -1362,14 +1620,21 @@ Library::Library(QObject *parent)
     m_homeRows = new RowsModel(this);
     m_movieRows = new RowsModel(this);
     m_seriesRows = new RowsModel(this);
+    m_models = {m_all, m_movies, m_series, m_myList, m_continue, m_search};
+    m_collator = QCollator(QLocale(QLocale::English));
+    m_collator.setCaseSensitivity(Qt::CaseInsensitive);
+    m_collator.setNumericMode(true);
+    m_ioPool.setMaxThreadCount(1); // writes stay in order and never interleave
+    m_scanMemory = std::make_shared<ScanMemory>();
 
-    m_watcher = new QFutureWatcher<QVector<Title>>(this);
+    m_watcher = new QFutureWatcher<ScanResult>(this);
+    connect(m_watcher, &QFutureWatcherBase::resultReadyAt, this, &Library::onScanResult);
     connect(m_watcher, &QFutureWatcherBase::finished, this, &Library::onScanFinished);
 
     m_saveTimer = new QTimer(this);
     m_saveTimer->setSingleShot(true);
-    m_saveTimer->setInterval(2000);
-    connect(m_saveTimer, &QTimer::timeout, this, &Library::saveWatchState);
+    m_saveTimer->setInterval(kStateSaveMs);
+    connect(m_saveTimer, &QTimer::timeout, this, [this] { saveWatchState(); });
 
     // Qt 6.10's FFmpeg media backend (hero preview / player) attaches a continuation to a QFuture that
     // reports two results and logs "Parent future has 2 result(s)" on every media load. It is harmless
@@ -1380,10 +1645,11 @@ Library::Library(QObject *parent)
     m_rescanTimer = new QTimer(this);
     m_rescanTimer->setSingleShot(true);
     m_rescanTimer->setInterval(3000);
-    connect(m_rescanTimer, &QTimer::timeout, this, &Library::rescan);
+    connect(m_rescanTimer, &QTimer::timeout, this, &Library::startScan); // only the reported folders are read again
     m_fsWatcher = new QFileSystemWatcher(this);
     connect(m_fsWatcher, &QFileSystemWatcher::directoryChanged, this, [this](const QString &dir) {
         TIMING("folder changed: %s", qPrintable(dir));
+        m_dirtyDirs.insert(dir);
         // debounce, but don't let a constant stream of events (an active download) postpone it forever
         const qint64 now = QDateTime::currentMSecsSinceEpoch();
         if (!m_rescanTimer->isActive())
@@ -1394,13 +1660,13 @@ Library::Library(QObject *parent)
 
     m_refreshTimer = new QTimer(this);
     m_refreshTimer->setSingleShot(true);
-    m_refreshTimer->setInterval(0);
+    m_refreshTimer->setInterval(kRefreshMs);
     connect(m_refreshTimer, &QTimer::timeout, this, &Library::flushRefresh);
 
     m_cacheSaveTimer = new QTimer(this);
     m_cacheSaveTimer->setSingleShot(true);
-    m_cacheSaveTimer->setInterval(1500);
-    connect(m_cacheSaveTimer, &QTimer::timeout, this, &Library::saveScanCache);
+    m_cacheSaveTimer->setInterval(kCacheSaveMs);
+    connect(m_cacheSaveTimer, &QTimer::timeout, this, [this] { saveScanCache(); });
 
     TIMING("Library created");
     loadSettings();
@@ -1425,12 +1691,20 @@ void Library::setThumbnailProvider(ThumbnailProvider *provider)
     m_thumbs = provider;
 }
 
+void Library::setWarmUpSkip(std::function<bool(const QString &)> skip)
+{
+    m_warmSkip = std::move(skip);
+}
+
+// Pending writes happen synchronously here (after queued background writes, so the newest state wins).
 Library::~Library()
 {
     if (s_instance == this) s_instance = nullptr;
-    saveWatchState();
+    if (m_watchDirty || (m_saveTimer && m_saveTimer->isActive()))
+        saveWatchState(true);
     if (m_cacheSaveTimer && m_cacheSaveTimer->isActive())
-        saveScanCache();
+        saveScanCache(true);
+    m_ioPool.waitForDone();
 }
 
 // ---------------------------------------------------------------- settings / persistence
@@ -1478,39 +1752,66 @@ void Library::loadWatchState()
             m_myListIds << v.toString();
 }
 
-void Library::saveWatchState()
+// Snapshot (implicitly shared, so O(1)) on the GUI thread; serialization and the file write run on the
+// one-thread I/O pool, or inline when `sync` (destructor).
+void Library::saveWatchState(bool sync)
 {
     if (m_saveTimer)
         m_saveTimer->stop();
-    const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    QDir().mkpath(dir);
-    QJsonObject prog;
-    for (auto it = m_progress.cbegin(); it != m_progress.cend(); ++it) {
-        QJsonObject o;
-        o.insert(QStringLiteral("positionMs"), double(it->positionMs));
-        o.insert(QStringLiteral("durationMs"), double(it->durationMs));
-        o.insert(QStringLiteral("lastPlayed"), it->lastPlayed.toString(Qt::ISODateWithMs));
-        prog.insert(it.key(), o);
-    }
-    QJsonObject root;
-    root.insert(QStringLiteral("progress"), prog);
-    root.insert(QStringLiteral("myList"), QJsonArray::fromStringList(m_myListIds));
-    QSaveFile f(dir + QStringLiteral("/watchstate.json"));
-    if (f.open(QIODevice::WriteOnly)) {
-        f.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
-        f.commit();
+    m_watchDirty = false;
+    const QHash<QString, Progress> progress = m_progress;
+    const QStringList myList = m_myListIds;
+    auto write = [progress, myList]() {
+        const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+        QDir().mkpath(dir);
+        QJsonObject prog;
+        for (auto it = progress.cbegin(); it != progress.cend(); ++it) {
+            QJsonObject o;
+            o.insert(QStringLiteral("positionMs"), double(it->positionMs));
+            o.insert(QStringLiteral("durationMs"), double(it->durationMs));
+            o.insert(QStringLiteral("lastPlayed"), it->lastPlayed.toString(Qt::ISODateWithMs));
+            prog.insert(it.key(), o);
+        }
+        QJsonObject root;
+        root.insert(QStringLiteral("progress"), prog);
+        root.insert(QStringLiteral("myList"), QJsonArray::fromStringList(myList));
+        writeFileAtomic(dir + QStringLiteral("/watchstate.json"), QJsonDocument(root).toJson(QJsonDocument::Compact));
+    };
+    if (sync) {
+        m_ioPool.waitForDone();
+        write();
+    } else {
+        m_ioPool.start(write);
     }
 }
 
-void Library::scheduleSave()
+// Marks the watch state dirty and makes sure it is written within delayMs (an earlier deadline is kept).
+void Library::scheduleSave(int delayMs)
 {
-    if (!m_saveTimer->isActive())
-        m_saveTimer->start();
+    m_watchDirty = true;
+    if (!m_saveTimer->isActive() || m_saveTimer->remainingTime() > delayMs)
+        m_saveTimer->start(delayMs);
+}
+
+void Library::flushProgress()
+{
+    if (m_watchDirty || m_saveTimer->isActive())
+        saveWatchState();
 }
 
 // ---------------------------------------------------------------- folders / scanning
 
+// Manual rescan / folder list changed: every folder is read again.
 void Library::rescan()
+{
+    m_fullRescan = true;
+    startScan();
+}
+
+// Auto-rescans (watcher) only read the folders reported as changed (plus new subfolders) and re-use the
+// other listings of the previous walk; the result is otherwise identical to a full scan. Full scans happen
+// when asked for, on the first scan of a session and when not every folder could be watched.
+void Library::startScan()
 {
     if (m_watcher->isRunning()) {
         m_rescanPending = true;
@@ -1521,39 +1822,119 @@ void Library::rescan()
         m_scanning = true;
         emit scanningChanged();
     }
-    const QStringList folders = m_folders;
+    ScanJob job;
+    job.folders = m_folders;
+    job.full = m_fullRescan || !m_dirCacheComplete;
+    job.dirty = std::exchange(m_dirtyDirs, {});
+    job.known = m_baseTitles;
+    m_fullRescan = false;
     auto extras = std::make_shared<ScanExtras>();
     m_scanExtras = extras;
-    TIMING("scan started");
-    m_watcher->setFuture(QtConcurrent::run([folders, extras]() { return scanFolders(folders, extras.get()); }));
+    const std::shared_ptr<ScanMemory> mem = m_scanMemory;
+    const std::shared_ptr<OverlayCheck> check = std::exchange(m_overlayCheck, nullptr);
+    if (job.full)
+        TIMING("scan started (full)");
+    else
+        TIMING("scan started (%d changed folders)", int(job.dirty.size()));
+    m_watcher->setFuture(QtConcurrent::run([job, mem, extras, check](QPromise<ScanResult> &promise) {
+        if (check) { // overlays restored from the scan cache: are their image files still there?
+            ScanResult r;
+            r.kind = ScanResult::OverlayCheck;
+            r.check = check;
+            auto verify = [&r](const QHash<QString, QVariantMap> &maps) {
+                for (auto it = maps.cbegin(); it != maps.cend(); ++it)
+                    for (const QString &k : overlayFileKeys()) {
+                        const QString p = it.value().value(k).toString();
+                        if (!p.isEmpty() && !QFileInfo::exists(p))
+                            r.brokenOverlays.insert(it.key().section(QLatin1Char('/'), 0, 0));
+                    }
+            };
+            verify(check->ext);
+            verify(check->extEp);
+            promise.addResult(std::move(r));
+        }
+        const Publish publish = [&promise](QVector<Title> &&titles) {
+            ScanResult r;
+            r.kind = ScanResult::Partial;
+            r.titles = std::move(titles);
+            promise.addResult(std::move(r));
+        };
+        ScanResult r;
+        r.titles = scanFolders(job, *mem, extras.get(), publish);
+        promise.addResult(std::move(r));
+    }));
+}
+
+void Library::onScanResult(int index)
+{
+    ScanResult r = m_watcher->resultAt(index);
+    if (r.kind == ScanResult::OverlayCheck) {
+        if (!r.brokenOverlays.isEmpty() && r.check)
+            dropOverlays(r.brokenOverlays, *r.check);
+        return;
+    }
+    QHash<QString, Title> base;
+    base.reserve(r.titles.size());
+    for (Title &t : r.titles) {
+        const QString id = t.id;
+        base.insert(id, std::move(t));
+    }
+
+    if (r.kind == ScanResult::Partial) { // progressive first scan / new folder: titles before ffprobe finished
+        bool structural = false;
+        applyTitles(std::move(base), false, true, &structural);
+        if (!m_publishedThisScan) {
+            m_publishedThisScan = true;
+            int pending = 0;
+            for (const Title &t : std::as_const(m_titles))
+                for (const MediaFile &f : t.files)
+                    pending += f.probed ? 0 : 1;
+            TIMING("first titles published: %d titles (%d files waiting for ffprobe)", int(m_titles.size()), pending);
+        }
+        if (structural)
+            emit libraryChanged();
+        return;
+    }
+
+    const std::shared_ptr<ScanExtras> extras = m_scanExtras;
+    if (extras)
+        TIMING("scan finished: %d titles in %lld ms (walk %lld ms, %d of %d folders read; %d files probed, probe+parse %lld ms;"
+               " %d still being written, %d rejected)", int(base.size()), extras->ms, extras->walkMs,
+               extras->listedDirs, extras->totalDirs, extras->probed, extras->probeMs, extras->unstable,
+               extras->rejected);
+    const bool first = !m_haveScanned;
+    m_haveScanned = true;
+    const bool changed = applyTitles(std::move(base), false);
+    if (m_featuredProvisional) { // hero picked while durations were unknown: pick again if a better tier exists
+        m_featuredProvisional = false;
+        improveFeatured();
+    }
+    if (changed || first)
+        emit libraryChanged();
+    if (extras) {
+        const bool allWatched = updateWatcher(extras->dirs);
+        m_dirCacheComplete = allWatched && extras->totalDirs <= kMaxWatchedDirs;
+        // folders seen for the first time were read before they were watched: read them once more, so files
+        // created in between are not missed
+        if (!extras->newDirs.isEmpty()) {
+            for (const QString &d : std::as_const(extras->newDirs))
+                m_dirtyDirs.insert(d);
+            if (!m_rescanTimer->isActive())
+                m_rescanTimer->start(1000);
+        }
+    }
+    if (changed)
+        saveScanCache();
+    if (changed || first)
+        queueWarmUp();
 }
 
 void Library::onScanFinished()
 {
-    QVector<Title> result = m_watcher->future().resultCount() ? m_watcher->result() : QVector<Title>();
     const std::shared_ptr<ScanExtras> extras = m_scanExtras;
-    QHash<QString, Title> base;
-    base.reserve(result.size());
-    for (Title &t : result) {
-        const QString id = t.id;
-        base.insert(id, std::move(t));
-    }
-    if (extras)
-        TIMING("scan finished: %d titles in %lld ms (%d still being written, %d rejected)", int(base.size()),
-               extras->ms, extras->unstable, extras->rejected);
-    const bool first = !m_haveScanned;
-    m_haveScanned = true;
-    const bool changed = applyTitles(std::move(base), false);
-    if (changed || first)
-        emit libraryChanged();
-    if (extras)
-        updateWatcher(extras->dirs);
-    if (changed)
-        saveScanCache();
-    queueWarmUp();
-
+    m_publishedThisScan = false;
     if (m_rescanPending) {
-        rescan();
+        startScan();
         return;
     }
     if (extras && extras->unstable > 0 && !m_rescanTimer->isActive())
@@ -1564,20 +1945,24 @@ void Library::onScanFinished()
 
 // Installs a new set of scanned titles (from a scan or the scan cache), re-applies the external
 // metadata overlays, and updates the models incrementally. Returns true if anything changed.
-bool Library::applyTitles(QHash<QString, Title> base, bool fromCache)
+// `partial`: an intermediate result of a progressive scan (files may not be probed yet).
+bool Library::applyTitles(QHash<QString, Title> base, bool fromCache, bool partial, bool *structuralOut)
 {
     QHash<QString, Title> titles;
     QHash<QString, QString> pathToId;
     QHash<QString, QVariantMap> ident;
     titles.reserve(base.size());
+    bool unprobed = false;
     for (auto it = base.cbegin(); it != base.cend(); ++it) {
         const Title &b = it.value();
         ident.insert(b.id, {{QStringLiteral("title"), b.title}, {QStringLiteral("year"), b.year},
                             {QStringLiteral("isSeries"), b.isSeries}});
         Title t = b;
         applyOverlay(t);
-        for (const MediaFile &f : t.files)
+        for (const MediaFile &f : t.files) {
             pathToId.insert(f.path, t.id);
+            unprobed |= !f.probed;
+        }
         titles.insert(t.id, std::move(t));
     }
 
@@ -1585,33 +1970,50 @@ bool Library::applyTitles(QHash<QString, Title> base, bool fromCache)
     bool structural = titles.size() != m_titles.size();
     for (auto it = titles.cbegin(); it != titles.cend(); ++it) {
         const auto old = m_titles.constFind(it.key());
-        if (old == m_titles.cend())
+        if (old == m_titles.cend()) {
             structural = true;
-        else if (!sameTitle(old.value(), it.value()))
+        } else if (!sameTitle(old.value(), it.value())) {
             changedIds.insert(it.key());
+            // no frame could be grabbed before ffprobe ran (unknown duration): new image URLs refetch them
+            if (hasUnprobed(old.value()) && !hasUnprobed(it.value()))
+                ++m_artGen[it.key()];
+        }
     }
+    if (structuralOut)
+        *structuralOut = structural;
     const bool changed = structural || !changedIds.isEmpty();
     m_baseTitles = std::move(base);
+    m_baseUnprobed = unprobed;
     m_parsedIdentity = std::move(ident);
     if (!changed) {
         TIMING("library unchanged");
         return false;
     }
+    for (Title &t : titles)
+        prepare(t);
     {
         QMutexLocker lock(&m_mutex);
         m_titles = std::move(titles);
         m_pathToId = std::move(pathToId);
     }
-    if (!fromCache)
+    m_resumeCache.clear();
+    if (!fromCache && !partial)
         pruneProgress();
     rebuildModels(); // diffed: unchanged models keep their rows
-    for (const QString &id : std::as_const(changedIds))
+    if (changedIds.size() > kBulkRefresh) {
         for (TitleModel *m : allModels())
-            m->refresh(id);
-    if (m_featuredId.isEmpty() || !m_titles.contains(m_featuredId))
+            m->refreshAll();
+    } else {
+        for (const QString &id : std::as_const(changedIds))
+            for (TitleModel *m : allModels())
+                m->refresh(id);
+    }
+    if (m_featuredId.isEmpty() || !m_titles.contains(m_featuredId)) {
         pickFeatured();
-    else if (changedIds.contains(m_featuredId))
+        m_featuredProvisional = partial;
+    } else if (changedIds.contains(m_featuredId)) {
         emit featuredChanged();
+    }
     TIMING("models updated: %d titles (%d changed%s)", int(m_titles.size()), int(changedIds.size()),
            structural ? ", structural" : "");
     return true;
@@ -1645,21 +2047,37 @@ void Library::removeFolder(const QString &dir)
 
 // ---------------------------------------------------------------- models
 
+// Derived per-title values, so role reads / sorts don't recompute them (GUI thread; after m_artGen changes).
+void Library::prepare(Title &t) const
+{
+    QSet<int> seasons;
+    int w = 0, h = 0;
+    qint64 total = 0;
+    for (const MediaFile &f : std::as_const(t.files)) {
+        if (f.season > 0)
+            seasons.insert(f.season);
+        w = std::max(w, f.width);
+        h = std::max(h, f.height);
+        total += f.durationMs;
+    }
+    t.seasonCount = !t.isSeries ? 0 : int(seasons.isEmpty() ? 1 : seasons.size());
+    t.quality = qualityLabel(w, h);
+    t.totalMs = total;
+    t.cardUrl = QUrl(imageUrl(t, "card"));
+    t.backdropUrl = QUrl(imageUrl(t, "backdrop"));
+    t.logoUrl = t.logoFile.isEmpty() ? QUrl() : QUrl::fromLocalFile(t.logoFile);
+    QString key = t.title;
+    if (key.startsWith(QLatin1String("The "), Qt::CaseInsensitive))
+        key = key.mid(4);
+    t.sortKey = m_collator.sortKey(key);
+}
+
 void Library::rebuildModels()
 {
-    QCollator coll(QLocale(QLocale::English));
-    coll.setCaseSensitivity(Qt::CaseInsensitive);
-    coll.setNumericMode(true);
     m_orderedIds = m_titles.keys();
-    std::sort(m_orderedIds.begin(), m_orderedIds.end(), [&](const QString &a, const QString &b) {
-        const Title &ta = m_titles[a], &tb = m_titles[b];
-        auto key = [](const Title &t) {
-            QString s = t.title;
-            if (s.startsWith(QLatin1String("The "), Qt::CaseInsensitive))
-                s = s.mid(4);
-            return s;
-        };
-        const int c = coll.compare(key(ta), key(tb));
+    std::sort(m_orderedIds.begin(), m_orderedIds.end(), [this](const QString &a, const QString &b) {
+        const Title &ta = *findTitle(a), &tb = *findTitle(b);
+        const int c = ta.sortKey && tb.sortKey ? ta.sortKey->compare(*tb.sortKey) : m_collator.compare(ta.title, tb.title);
         if (c != 0) return c < 0;
         if (ta.year != tb.year) return ta.year < tb.year;
         return a < b;
@@ -1667,7 +2085,7 @@ void Library::rebuildModels()
 
     QStringList movies, series;
     for (const QString &id : std::as_const(m_orderedIds))
-        (m_titles[id].isSeries ? series : movies) << id;
+        (m_titles.constFind(id)->isSeries ? series : movies) << id;
     m_all->setIds(m_orderedIds);
     m_movies->setIds(movies);
     m_series->setIds(series);
@@ -1677,27 +2095,17 @@ void Library::rebuildModels()
     rebuildRows();
 }
 
-QList<TitleModel *> Library::allModels() const
-{
-    QList<TitleModel *> list = {m_all, m_movies, m_series, m_myList, m_continue, m_search};
-    for (RowsModel *rm : {m_homeRows, m_movieRows, m_seriesRows})
-        for (TitleModel *m : rm->findChildren<TitleModel *>(QString(), Qt::FindDirectChildrenOnly))
-            if (!list.contains(m))
-                list << m;
-    return list;
-}
-
-void Library::refreshTitle(const QString &id)
+void Library::refreshTitle(const QString &id, const QList<int> &roles)
 {
     if (id.isEmpty())
         return;
     for (TitleModel *m : allModels())
-        m->refresh(id);
+        m->refresh(id, roles);
     if (id == m_featuredId)
         emit featuredChanged();
 }
 
-void Library::rebuildContinue()
+bool Library::rebuildContinue()
 {
     struct E { QString id; QDateTime t; };
     QVector<E> list;
@@ -1715,10 +2123,16 @@ void Library::rebuildContinue()
         return a.id < b.id;
     });
     QStringList ids;
+    QSet<QString> seen;
     for (const E &e : list)
-        if (!ids.contains(e.id))
+        if (!seen.contains(e.id)) {
+            seen.insert(e.id);
             ids << e.id;
+        }
+    if (ids == m_continue->ids())
+        return false;
     m_continue->setIds(ids);
+    return true;
 }
 
 void Library::rebuildMyList()
@@ -1739,7 +2153,7 @@ void Library::rebuildSearch()
     }
     QStringList prefix, rest;
     for (const QString &id : std::as_const(m_orderedIds)) {
-        const Title &t = m_titles[id];
+        const Title &t = *findTitle(id);
         if (t.title.startsWith(q, Qt::CaseInsensitive)) {
             prefix << id;
             continue;
@@ -1767,13 +2181,17 @@ void Library::setSearchQuery(const QString &q)
 
 void Library::rebuildRows()
 {
+    auto title = [this](const QString &id) -> const Title & { return *findTitle(id); };
     // one persistent TitleModel per (RowsModel, kind, name)
     auto rowModel = [this](RowsModel *rm, const QString &key) {
-        for (TitleModel *m : rm->findChildren<TitleModel *>(QString(), Qt::FindDirectChildrenOnly))
+        QList<TitleModel *> &list = m_rowModels[rm];
+        for (TitleModel *m : std::as_const(list))
             if (m->objectName() == key)
                 return m;
         auto *m = new TitleModel(this, rm);
         m->setObjectName(key);
+        list << m;
+        m_models << m;
         return m;
     };
     // categories get their own key space so a folder called "Movies" can't collide with the "Movies" row
@@ -1785,21 +2203,24 @@ void Library::rebuildRows()
         m->setIds(ids);
         rows.append({name, kind, m});
     };
-
-    auto recent = [this](const QStringList &ids, int n) {
-        QStringList l = ids;
-        std::stable_sort(l.begin(), l.end(), [this](const QString &a, const QString &b) {
-            const Title &ta = m_titles[a], &tb = m_titles[b];
+    // the first n of `ids` in `less` order (a total order, so this equals a full stable sort's prefix)
+    auto firstN = [](QStringList l, int n, const auto &less) {
+        n = std::min(n, int(l.size()));
+        std::partial_sort(l.begin(), l.begin() + n, l.end(), less);
+        return l.mid(0, n);
+    };
+    auto recent = [&](const QStringList &ids, int n) {
+        return firstN(ids, n, [&](const QString &a, const QString &b) {
+            const Title &ta = title(a), &tb = title(b);
             if (ta.added != tb.added) return ta.added > tb.added;
             return a < b;
         });
-        return l.mid(0, n);
     };
     // categories: ordered by size desc, then name
-    auto byCategory = [this](const QStringList &ids) {
+    auto byCategory = [&](const QStringList &ids) {
         QMap<QString, QStringList> cats;
         for (const QString &id : ids)
-            cats[m_titles[id].category] << id;
+            cats[title(id).category] << id;
         QList<QPair<QString, QStringList>> list;
         for (auto it = cats.cbegin(); it != cats.cend(); ++it)
             list.append({it.key(), it.value()});
@@ -1807,6 +2228,14 @@ void Library::rebuildRows()
             return a.second.size() > b.second.size();
         });
         return list;
+    };
+    // rows that disappeared keep their (persistent) model; empty it so it holds no stale ids
+    auto clearUnused = [this](RowsModel *rm) {
+        for (TitleModel *m : std::as_const(m_rowModels[rm])) {
+            bool used = false;
+            for (const auto &r : rm->rows()) used |= r.model == m;
+            if (!used) m->setIds({});
+        }
     };
     const QStringList movies = m_movies->ids();
     const QStringList series = m_series->ids();
@@ -1823,21 +2252,13 @@ void Library::rebuildRows()
         if (m_myList->rowCount() > 0)
             rows.append({QStringLiteral("My List"), QStringLiteral("mylist"), m_myList});
         addRow(rows, m_homeRows, QStringLiteral("normal"), QStringLiteral("Recently Added"), recent(m_orderedIds, 20));
-
-        QStringList top = m_orderedIds;
-        auto total = [this](const QString &id) {
-            qint64 s = 0;
-            for (const MediaFile &f : m_titles[id].files) s += f.durationMs;
-            return s;
-        };
-        std::stable_sort(top.begin(), top.end(), [&](const QString &a, const QString &b) {
-            const qint64 da = total(a), db = total(b);
-            if (da != db) return da > db;
-            const auto ea = m_titles[a].files.size(), eb = m_titles[b].files.size();
-            if (ea != eb) return ea > eb;
+        const QStringList top = firstN(m_orderedIds, 10, [&](const QString &a, const QString &b) {
+            const Title &ta = title(a), &tb = title(b);
+            if (ta.totalMs != tb.totalMs) return ta.totalMs > tb.totalMs;
+            if (ta.files.size() != tb.files.size()) return ta.files.size() > tb.files.size();
             return a < b;
         });
-        addRow(rows, m_homeRows, QStringLiteral("top10"), QStringLiteral("Top 10 in Your Library"), top.mid(0, 10));
+        addRow(rows, m_homeRows, QStringLiteral("top10"), QStringLiteral("Top 10 in Your Library"), top);
         for (const auto &c : byCategory(m_orderedIds))
             addRow(rows, m_homeRows, QStringLiteral("normal"), c.first, c.second, true);
         if (!movies.isEmpty() && !series.isEmpty()) {
@@ -1854,23 +2275,31 @@ void Library::rebuildRows()
         for (const auto &c : byCategory(ids))
             addRow(rows, rm, QStringLiteral("normal"), c.first, c.second, true);
         rm->setRows(rows);
-        // rows that disappeared keep their (persistent) model; empty it so it holds no stale ids
-        for (TitleModel *m : rm->findChildren<TitleModel *>(QString(), Qt::FindDirectChildrenOnly)) {
-            bool used = false;
-            for (const auto &r : rows) used |= r.model == m;
-            if (!used) m->setIds({});
-        }
+        clearUnused(rm);
     };
     pageRows(m_movieRows, movies, contMovies);
     pageRows(m_seriesRows, series, contSeries);
-    for (TitleModel *m : m_homeRows->findChildren<TitleModel *>(QString(), Qt::FindDirectChildrenOnly)) {
-        bool used = false;
-        for (const auto &r : m_homeRows->rows()) used |= r.model == m;
-        if (!used) m->setIds({});
-    }
+    clearUnused(m_homeRows);
 }
 
 // ---------------------------------------------------------------- featured
+
+namespace {
+// 0 = best hero material (a real movie/show, long enough) .. 3 = recordings / clips
+int featuredTier(const Title &t)
+{
+    const QString stem = QFileInfo(t.files.first().path).completeBaseName();
+    const bool recording = !t.isSeries && (looksLikeRecording(stem) || looksLikeTicket(stem));
+    qint64 dur = 0;
+    for (const MediaFile &f : t.files) dur = std::max(dur, f.durationMs);
+    const bool longEnough = dur > 20 * 60 * 1000;
+    const bool real = (t.isSeries || t.year > 0) && !recording;
+    if (real && longEnough) return 0;
+    if (real) return 1;
+    if (longEnough && !recording) return 2;
+    return 3;
+}
+} // namespace
 
 void Library::pickFeatured()
 {
@@ -1882,19 +2311,8 @@ void Library::pickFeatured()
         return;
     }
     QStringList tiers[4];
-    for (auto it = m_titles.cbegin(); it != m_titles.cend(); ++it) {
-        const Title &t = it.value();
-        const QString stem = QFileInfo(t.files.first().path).completeBaseName();
-        const bool recording = !t.isSeries && (looksLikeRecording(stem) || looksLikeTicket(stem));
-        qint64 dur = 0;
-        for (const MediaFile &f : t.files) dur = std::max(dur, f.durationMs);
-        const bool longEnough = dur > 20 * 60 * 1000;
-        const bool real = (t.isSeries || t.year > 0) && !recording;
-        if (real && longEnough) tiers[0] << it.key();
-        else if (real) tiers[1] << it.key();
-        else if (longEnough && !recording) tiers[2] << it.key();
-        else tiers[3] << it.key();
-    }
+    for (auto it = m_titles.cbegin(); it != m_titles.cend(); ++it)
+        tiers[featuredTier(it.value())] << it.key();
     for (QStringList &tier : tiers) {
         if (tier.isEmpty())
             continue;
@@ -1905,6 +2323,23 @@ void Library::pickFeatured()
         emit featuredChanged();
         return;
     }
+}
+
+// The hero was picked from a progressive scan's titles (durations unknown): pick again only if a better tier
+// than the current hero's exists now.
+void Library::improveFeatured()
+{
+    const Title *cur = findTitle(m_featuredId);
+    if (!cur) {
+        pickFeatured();
+        return;
+    }
+    const int tier = featuredTier(*cur);
+    for (const Title &t : std::as_const(m_titles))
+        if (featuredTier(t) < tier) {
+            pickFeatured();
+            return;
+        }
 }
 
 QVariantMap Library::featured() const
@@ -1932,32 +2367,41 @@ double Library::progressFor(const QString &path) const
     return std::clamp(double(it->positionMs) / double(dur), 0.0, 1.0);
 }
 
+// Memoized per title (roles read it up to five times per delegate); progressUpdated() / applyTitles() drop it.
 int Library::resumeIndex(const Title &t) const
 {
-    if (t.files.isEmpty())
-        return -1;
-    int best = -1;
-    QDateTime bestTime;
-    for (int i = 0; i < t.files.size(); ++i) {
-        auto it = m_progress.constFind(t.files.at(i).path);
-        if (it == m_progress.cend())
-            continue;
-        if (best < 0 || it->lastPlayed > bestTime) {
-            best = i;
-            bestTime = it->lastPlayed;
+    const auto memo = m_resumeCache.constFind(t.id);
+    if (memo != m_resumeCache.cend())
+        return memo.value();
+    auto compute = [&]() -> int {
+        if (t.files.isEmpty())
+            return -1;
+        int best = -1;
+        QDateTime bestTime;
+        for (int i = 0; i < t.files.size(); ++i) {
+            auto it = m_progress.constFind(t.files.at(i).path);
+            if (it == m_progress.cend())
+                continue;
+            if (best < 0 || it->lastPlayed > bestTime) {
+                best = i;
+                bestTime = it->lastPlayed;
+            }
         }
-    }
-    if (best < 0) {
-        for (int i = 0; i < t.files.size(); ++i)
-            if (!t.isSeries || t.files.at(i).season != 0)
-                return i;
-        return 0;
-    }
-    // finished an episode -> point at the next one
-    if (t.isSeries && progressFor(t.files.at(best).path) >= 0.95 && best + 1 < t.files.size()
-        && (t.files.at(best + 1).season == 0) == (t.files.at(best).season == 0))
-        return best + 1;
-    return best;
+        if (best < 0) {
+            for (int i = 0; i < t.files.size(); ++i)
+                if (!t.isSeries || t.files.at(i).season != 0)
+                    return i;
+            return 0;
+        }
+        // finished an episode -> point at the next one
+        if (t.isSeries && progressFor(t.files.at(best).path) >= 0.95 && best + 1 < t.files.size()
+            && (t.files.at(best + 1).season == 0) == (t.files.at(best).season == 0))
+            return best + 1;
+        return best;
+    };
+    const int i = compute();
+    m_resumeCache.insert(t.id, i);
+    return i;
 }
 
 QVariant Library::roleData(const Title &t, int role, int rank) const
@@ -1973,12 +2417,7 @@ QVariant Library::roleData(const Title &t, int role, int rank) const
     case TitleModel::PathRole: { auto f = file(); return f ? f->path : QString(); }
     case TitleModel::SourceUrlRole: { auto f = file(); return f ? QUrl::fromLocalFile(f->path) : QUrl(); }
     case TitleModel::IsSeriesRole: return t.isSeries;
-    case TitleModel::SeasonCountRole: {
-        if (!t.isSeries) return 0;
-        QSet<int> s;
-        for (const MediaFile &f : t.files) if (f.season > 0) s.insert(f.season);
-        return int(s.isEmpty() ? 1 : s.size());
-    }
+    case TitleModel::SeasonCountRole: return t.seasonCount;
     case TitleModel::EpisodeCountRole: return int(t.isSeries ? t.files.size() : 0);
     case TitleModel::DurationMsRole: {
         auto f = file();
@@ -1986,13 +2425,9 @@ QVariant Library::roleData(const Title &t, int role, int rank) const
         if (f->durationMs > 0) return f->durationMs;
         return m_progress.value(f->path).durationMs;
     }
-    case TitleModel::QualityRole: {
-        int w = 0, h = 0;
-        for (const MediaFile &f : t.files) { w = std::max(w, f.width); h = std::max(h, f.height); }
-        return qualityLabel(w, h);
-    }
-    case TitleModel::CardImageRole: return QUrl(imageUrl(t, "card"));
-    case TitleModel::BackdropImageRole: return QUrl(imageUrl(t, "backdrop"));
+    case TitleModel::QualityRole: return t.quality;
+    case TitleModel::CardImageRole: return t.cardUrl;
+    case TitleModel::BackdropImageRole: return t.backdropUrl;
     case TitleModel::PositionMsRole: { auto f = file(); return f ? positionFor(f->path) : qint64(0); }
     case TitleModel::ProgressRole: { auto f = file(); return f ? progressFor(f->path) : 0.0; }
     case TitleModel::InMyListRole: return m_myListIds.contains(t.id);
@@ -2003,8 +2438,9 @@ QVariant Library::roleData(const Title &t, int role, int rank) const
     case TitleModel::GenresRole: return t.genres;
     case TitleModel::MatchRole: return t.match;
     case TitleModel::RankRole: return rank;
-    case TitleModel::LogoImageRole: return t.logoFile.isEmpty() ? QUrl() : QUrl::fromLocalFile(t.logoFile);
+    case TitleModel::LogoImageRole: return t.logoUrl;
     case TitleModel::HasMetaRole: return t.hasExternalMeta;
+    case TitleModel::IsRecentRole: return isRecentDate(t.added, QDateTime::currentMSecsSinceEpoch());
     default: return {};
     }
 }
@@ -2022,6 +2458,42 @@ QVariantMap Library::title(const QString &id) const
 {
     const Title *t = findTitle(id);
     return t ? titleToMap(*t, 0) : QVariantMap();
+}
+
+QVariantList Library::recentTitles(int n) const
+{
+    // (added, alphabetical position): newest first, ties in alphabetical order; unknown dates last
+    QVector<QPair<qint64, int>> order;
+    order.reserve(m_orderedIds.size());
+    for (int i = 0; i < m_orderedIds.size(); ++i) {
+        const QDateTime &added = m_titles.constFind(m_orderedIds.at(i))->added;
+        order.append({added.isValid() ? added.toMSecsSinceEpoch() : std::numeric_limits<qint64>::min(), i});
+    }
+    n = std::clamp(n, 0, int(order.size()));
+    std::partial_sort(order.begin(), order.begin() + n, order.end(), [](const auto &a, const auto &b) {
+        if (a.first != b.first) return a.first > b.first;
+        return a.second < b.second;
+    });
+    QVariantList out;
+    for (int k = 0; k < n; ++k)
+        out << titleToMap(*m_titles.constFind(m_orderedIds.at(order.at(k).second)), 0);
+    return out;
+}
+
+int Library::recentCount() const
+{
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    return int(std::count_if(m_titles.cbegin(), m_titles.cend(), [now](const Title &t) { return isRecentDate(t.added, now); }));
+}
+
+int Library::episodeCount(const QString &id, int season) const
+{
+    const Title *t = findTitle(id);
+    if (!t)
+        return 0;
+    if (!t->isSeries)
+        return int(t->files.size());
+    return int(std::count_if(t->files.cbegin(), t->files.cend(), [season](const MediaFile &f) { return f.season == season; }));
 }
 
 QVariantList Library::seasons(const QString &id) const
@@ -2048,6 +2520,7 @@ QVariantList Library::episodes(const QString &id, int season) const
     QVariantList out;
     if (!t)
         return out;
+    const int gen = m_artGen.value(t->id);
     for (const MediaFile &f : t->files) {
         if (t->isSeries && f.season != season)
             continue;
@@ -2069,7 +2542,10 @@ QVariantList Library::episodes(const QString &id, int season) const
                    : f.season == 0 ? QStringLiteral("Bonus feature %1 of %2.").arg(f.episode).arg(t->title)
                                    : QStringLiteral("Episode %1 of Season %2.").arg(f.episode).arg(f.season);
         m.insert(QStringLiteral("description"), desc);
-        const QUrl thumbUrl(QStringLiteral("image://thumbs/%1/ep/%2/%3").arg(t->id).arg(f.season).arg(f.episode));
+        QString thumb = QStringLiteral("image://thumbs/%1/ep/%2/%3").arg(t->id).arg(f.season).arg(f.episode);
+        if (gen > 0) // see imageUrl()
+            thumb += QStringLiteral("?v=%1").arg(gen);
+        const QUrl thumbUrl(thumb);
         const QString still = ov.value(QStringLiteral("stillFile")).toString();
         m.insert(QStringLiteral("still"), still.isEmpty() ? thumbUrl : QUrl::fromLocalFile(still));
         m.insert(QStringLiteral("path"), f.path);
@@ -2245,6 +2721,8 @@ qint64 Library::position(const QString &path) const
     return positionFor(normPath(path));
 }
 
+// Called every ~5 s during playback: only the progress roles of that title are refreshed, and the rows are
+// rebuilt only when the Continue Watching list itself changes (a title enters / leaves / moves).
 void Library::setProgress(const QString &path, qint64 positionMs, qint64 durationMs)
 {
     const QString p = normPath(path);
@@ -2255,11 +2733,18 @@ void Library::setProgress(const QString &path, qint64 positionMs, qint64 duratio
     if (durationMs > 0)
         pr.durationMs = durationMs;
     pr.lastPlayed = QDateTime::currentDateTime();
-    scheduleSave();
+    scheduleSave(kProgressSaveMs);
     emit progressChanged(p);
-    rebuildContinue();
-    rebuildRows();
-    refreshTitle(m_pathToId.value(p));
+    progressUpdated(p);
+}
+
+void Library::progressUpdated(const QString &path)
+{
+    const QString id = m_pathToId.value(path);
+    m_resumeCache.remove(id);
+    if (rebuildContinue())
+        rebuildRows();
+    refreshTitle(id, progressRoles());
 }
 
 void Library::markWatched(const QString &path)
@@ -2274,11 +2759,9 @@ void Library::markWatched(const QString &path)
     pr.durationMs = dur;
     pr.positionMs = dur;
     pr.lastPlayed = QDateTime::currentDateTime();
-    scheduleSave();
+    scheduleSave(kStateSaveMs);
     emit progressChanged(p);
-    rebuildContinue();
-    rebuildRows();
-    refreshTitle(m_pathToId.value(p));
+    progressUpdated(p);
 }
 
 void Library::clearProgress(const QString &path)
@@ -2286,11 +2769,9 @@ void Library::clearProgress(const QString &path)
     const QString p = normPath(path);
     if (!m_progress.remove(p))
         return;
-    scheduleSave();
+    scheduleSave(kStateSaveMs);
     emit progressChanged(p);
-    rebuildContinue();
-    rebuildRows();
-    refreshTitle(m_pathToId.value(p));
+    progressUpdated(p);
 }
 
 void Library::toggleMyList(const QString &id)
@@ -2299,11 +2780,11 @@ void Library::toggleMyList(const QString &id)
         return;
     if (!m_myListIds.removeAll(id))
         m_myListIds << id;
-    scheduleSave();
+    scheduleSave(kStateSaveMs);
     emit myListChanged(id);
     rebuildMyList();
     rebuildRows();
-    refreshTitle(id);
+    refreshTitle(id, {TitleModel::InMyListRole});
 }
 
 bool Library::inMyList(const QString &id) const
@@ -2331,6 +2812,10 @@ QVariantMap Library::thumbInfo(const QString &id, int season, int episode) const
         if (!f)
             f = &t.files.first();
     }
+    // not probed yet (progressive first scan): without the duration a frame grab would pick the wrong spot and
+    // be cached for good; the provider draws a placeholder, and the title's image URLs change once it is probed
+    if (!f->probed)
+        return {};
     QVariantMap m;
     m.insert(QStringLiteral("title"), t.title);
     m.insert(QStringLiteral("path"), f->path);
@@ -2415,7 +2900,14 @@ void Library::setExternalMetadata(const QString &id, const QVariantMap &meta)
             return;
         m_extMeta.insert(id, meta);
     }
-    m_cacheSaveTimer->start();
+    scheduleCacheSave();
+    reapplyOverlay(id);
+}
+
+// m_extMeta[id] changed: rebuild the applied title from its scanned values. The model refresh is coalesced
+// (kRefreshMs), so a burst of metadata replies costs one re-sort and one refresh pass.
+void Library::reapplyOverlay(const QString &id)
+{
     const auto base = m_baseTitles.constFind(id);
     auto cur = m_titles.find(id);
     if (base == m_baseTitles.cend() || cur == m_titles.end())
@@ -2426,18 +2918,20 @@ void Library::setExternalMetadata(const QString &id, const QVariantMap &meta)
     const bool resort = cur->title != t.title || cur->year != t.year;
     if (sameTitle(cur.value(), t))
         return;
-    {
-        QMutexLocker lock(&m_mutex);
-        cur.value() = std::move(t);
-    }
     if (artChanged) {
         ++m_artGen[id];
         if (m_thumbs)
             m_thumbs->invalidate(id);
     }
+    prepare(t);
+    {
+        QMutexLocker lock(&m_mutex);
+        cur.value() = std::move(t);
+    }
     m_pendingRefresh.insert(id);
     m_pendingResort |= resort;
-    m_refreshTimer->start();
+    if (!m_refreshTimer->isActive())
+        m_refreshTimer->start();
 }
 
 void Library::setExternalEpisodeMetadata(const QString &id, int season, int episode, const QVariantMap &meta)
@@ -2458,11 +2952,12 @@ void Library::setExternalEpisodeMetadata(const QString &id, int season, int epis
             m_extEpisodeMeta.insert(key, meta);
         }
     }
-    m_cacheSaveTimer->start();
+    scheduleCacheSave();
     if (m_titles.contains(id)) {
         // lets views that show episode data (detail modal / player) re-query episodes()
         m_pendingRefresh.insert(id);
-        m_refreshTimer->start();
+        if (!m_refreshTimer->isActive())
+            m_refreshTimer->start();
     }
 }
 
@@ -2479,43 +2974,108 @@ void Library::flushRefresh()
         m_pendingResort = false;
         rebuildModels(); // order / search may change with a new title; rows are diffed, not reset
     }
+    if (ids.size() > kBulkRefresh) { // e.g. the metadata service's first sync: one pass per model
+        for (TitleModel *m : allModels())
+            m->refreshAll();
+        if (ids.contains(m_featuredId))
+            emit featuredChanged();
+        return;
+    }
     for (const QString &id : ids)
         refreshTitle(id); // also re-emits featuredChanged for the hero
 }
 
+// Restored overlays that reference missing files (checked by the first scan, off the GUI thread) are dropped;
+// the metadata service then re-applies them from its own cache, or not at all. Overlays that were replaced
+// since the restore are left alone.
+void Library::dropOverlays(const QSet<QString> &ids, const OverlayCheck &snapshot)
+{
+    int dropped = 0;
+    for (const QString &id : ids) {
+        const auto cur = m_extMeta.constFind(id);
+        if (cur != m_extMeta.cend() && snapshot.ext.contains(id) && cur.value() == snapshot.ext.value(id)) {
+            m_extMeta.erase(cur);
+            ++dropped;
+        }
+        {
+            QMutexLocker lock(&m_mutex);
+            const QString prefix = id + QLatin1Char('/');
+            for (auto it = m_extEpisodeMeta.begin(); it != m_extEpisodeMeta.end();) {
+                const auto snap = snapshot.extEp.constFind(it.key());
+                if (it.key().startsWith(prefix) && snap != snapshot.extEp.cend() && snap.value() == it.value())
+                    it = m_extEpisodeMeta.erase(it);
+                else
+                    ++it;
+            }
+        }
+        reapplyOverlay(id);
+        if (m_titles.contains(id))
+            m_pendingRefresh.insert(id); // episodes changed too
+    }
+    if (!m_pendingRefresh.isEmpty() && !m_refreshTimer->isActive())
+        m_refreshTimer->start();
+    scheduleCacheSave();
+    TIMING("dropped overlays of %d titles (%d with missing files)", dropped, int(ids.size()));
+}
+
 // ---------------------------------------------------------------- scan cache
 
-void Library::saveScanCache()
+// Debounced (kCacheSaveMs after the last change), but written at least every kCacheSaveMaxWaitMs while
+// changes keep coming (metadata replies stream in for a while).
+void Library::scheduleCacheSave()
+{
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (!m_cacheSaveTimer->isActive())
+        m_cacheDirtySince = now;
+    if (now - m_cacheDirtySince < kCacheSaveMaxWaitMs)
+        m_cacheSaveTimer->start(kCacheSaveMs);
+}
+
+// The data is snapshotted here (implicitly shared containers); JSON building and the write run on the
+// one-thread I/O pool (in order), or inline when `sync` (destructor).
+void Library::saveScanCache(bool sync)
 {
     m_cacheSaveTimer->stop();
-    QJsonArray titles;
-    QStringList ids = m_baseTitles.keys();
-    std::sort(ids.begin(), ids.end());
-    for (const QString &id : std::as_const(ids))
-        titles.append(titleToJson(m_baseTitles.value(id)));
-    QJsonObject ext, extEp;
-    for (auto it = m_extMeta.cbegin(); it != m_extMeta.cend(); ++it)
-        ext.insert(it.key(), QJsonObject::fromVariantMap(it.value()));
+    if (m_baseUnprobed)
+        return; // a progressive scan is running: its final result is saved (unprobed values never are)
+    const QHash<QString, Title> base = m_baseTitles;
+    const QHash<QString, QVariantMap> extMeta = m_extMeta;
+    QHash<QString, QVariantMap> extEpisodeMeta;
     {
         QMutexLocker lock(&m_mutex);
-        for (auto it = m_extEpisodeMeta.cbegin(); it != m_extEpisodeMeta.cend(); ++it)
-            extEp.insert(it.key(), QJsonObject::fromVariantMap(it.value()));
+        extEpisodeMeta = m_extEpisodeMeta;
     }
-    QJsonObject root;
-    root.insert(QStringLiteral("version"), 1);
-    root.insert(QStringLiteral("folders"), QJsonArray::fromStringList(m_folders));
-    root.insert(QStringLiteral("titles"), titles);
-    root.insert(QStringLiteral("ext"), ext);
-    root.insert(QStringLiteral("extEpisodes"), extEp);
-    QSaveFile f(cachePath(QStringLiteral("library-cache.json")));
-    if (f.open(QIODevice::WriteOnly)) {
-        f.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
-        f.commit();
+    const QStringList folders = m_folders;
+    auto write = [base, extMeta, extEpisodeMeta, folders]() {
+        QJsonArray titles;
+        QStringList ids = base.keys();
+        std::sort(ids.begin(), ids.end());
+        for (const QString &id : std::as_const(ids))
+            titles.append(titleToJson(base.value(id)));
+        QJsonObject ext, extEp;
+        for (auto it = extMeta.cbegin(); it != extMeta.cend(); ++it)
+            ext.insert(it.key(), QJsonObject::fromVariantMap(it.value()));
+        for (auto it = extEpisodeMeta.cbegin(); it != extEpisodeMeta.cend(); ++it)
+            extEp.insert(it.key(), QJsonObject::fromVariantMap(it.value()));
+        QJsonObject root;
+        root.insert(QStringLiteral("version"), 1);
+        root.insert(QStringLiteral("folders"), QJsonArray::fromStringList(folders));
+        root.insert(QStringLiteral("titles"), titles);
+        root.insert(QStringLiteral("ext"), ext);
+        root.insert(QStringLiteral("extEpisodes"), extEp);
+        writeFileAtomic(cachePath(QStringLiteral("library-cache.json")), QJsonDocument(root).toJson(QJsonDocument::Compact));
+    };
+    if (sync) {
+        m_ioPool.waitForDone();
+        write();
+    } else {
+        m_ioPool.start(write);
     }
 }
 
 // Populates the models from the last scan before the first (async) rescan finishes; the rescan then
-// only applies the differences.
+// only applies the differences. Overlay image files are not checked here (that would stat every poster
+// before the first frame): the first scan verifies them in the background (dropOverlays()).
 void Library::restoreScanCache()
 {
     QFile f(cachePath(QStringLiteral("library-cache.json")));
@@ -2530,43 +3090,33 @@ void Library::restoreScanCache()
     if (folders != m_folders)
         return;
 
-    // overlays: drop a title's overlays when any file they reference is gone (the metadata service then
-    // re-applies them from its own cache, or not at all)
     QHash<QString, QVariantMap> ext, extEp;
-    QSet<QString> broken;
-    auto filesOk = [](const QVariantMap &m) {
-        for (const QString &k : overlayFileKeys()) {
-            const QString p = m.value(k).toString();
-            if (!p.isEmpty() && !QFileInfo::exists(p))
-                return false;
-        }
-        return true;
+    bool anyFiles = false;
+    auto hasFiles = [](const QVariantMap &m) {
+        return std::any_of(overlayFileKeys().cbegin(), overlayFileKeys().cend(),
+                           [&m](const QString &k) { return !m.value(k).toString().isEmpty(); });
     };
     const QJsonObject extObj = root.value(QStringLiteral("ext")).toObject();
     for (auto it = extObj.begin(); it != extObj.end(); ++it) {
         QVariantMap m = it.value().toObject().toVariantMap();
         if (m.contains(QStringLiteral("genres"))) // QStringList round-trips as a QVariantList
             m.insert(QStringLiteral("genres"), m.value(QStringLiteral("genres")).toStringList());
-        if (!filesOk(m))
-            broken.insert(it.key());
+        anyFiles |= hasFiles(m);
         ext.insert(it.key(), m);
     }
     const QJsonObject epObj = root.value(QStringLiteral("extEpisodes")).toObject();
     for (auto it = epObj.begin(); it != epObj.end(); ++it) {
         const QVariantMap m = it.value().toObject().toVariantMap();
-        if (!filesOk(m))
-            broken.insert(it.key().section(QLatin1Char('/'), 0, 0));
+        anyFiles |= hasFiles(m);
         extEp.insert(it.key(), m);
     }
-    for (auto it = ext.begin(); it != ext.end();)
-        it = broken.contains(it.key()) ? ext.erase(it) : std::next(it);
-    for (auto it = extEp.begin(); it != extEp.end();)
-        it = broken.contains(it.key().section(QLatin1Char('/'), 0, 0)) ? extEp.erase(it) : std::next(it);
     m_extMeta = ext;
     {
         QMutexLocker lock(&m_mutex);
         m_extEpisodeMeta = extEp;
     }
+    if (anyFiles)
+        m_overlayCheck = std::make_shared<OverlayCheck>(OverlayCheck{ext, extEp});
 
     QHash<QString, Title> base;
     for (const QJsonValue &v : root.value(QStringLiteral("titles")).toArray()) {
@@ -2580,7 +3130,7 @@ void Library::restoreScanCache()
 
 // ---------------------------------------------------------------- auto-rescan / warm-up / cleanup
 
-void Library::updateWatcher(const QStringList &dirs)
+bool Library::updateWatcher(const QStringList &dirs)
 {
     QSet<QString> want(dirs.cbegin(), dirs.cend());
     for (const QString &f : std::as_const(m_folders))
@@ -2597,11 +3147,17 @@ void Library::updateWatcher(const QStringList &dirs)
             add << d;
     if (!remove.isEmpty())
         m_fsWatcher->removePaths(remove);
+    QStringList failed;
     if (!add.isEmpty())
-        m_fsWatcher->addPaths(add); // unwatchable dirs (permissions, inotify limit) are skipped
-    TIMING("watching %d folders", int(m_fsWatcher->directories().size()));
+        failed = m_fsWatcher->addPaths(add); // unwatchable dirs (permissions, inotify limit) are skipped
+    TIMING("watching %d folders%s", int(m_fsWatcher->directories().size()),
+           failed.isEmpty() ? "" : qPrintable(QStringLiteral(" (%1 could not be watched)").arg(failed.size())));
+    return failed.isEmpty();
 }
 
+// Pre-generates backdrop frames (featured title first) after a scan that changed something, and after the
+// first scan of a session. Portrait cards are not pre-generated (no view shows them up front) and episode
+// stills only per season, on request (warmSeason()). Cached frames cost one stat() per job.
 void Library::queueWarmUp()
 {
     if (!m_thumbs || qEnvironmentVariableIntValue("QTFLIX_NO_WARMUP") > 0)
@@ -2612,20 +3168,60 @@ void Library::queueWarmUp()
     for (const QString &id : std::as_const(m_orderedIds))
         if (id != m_featuredId)
             order << id;
-    QStringList jobs;
-    for (const QString &id : std::as_const(order))
-        jobs << id + QStringLiteral("/backdrop");
-    for (const QString &id : std::as_const(order))
-        jobs << id + QStringLiteral("/card");
+    m_warmBase.clear();
+    int skipped = 0;
     for (const QString &id : std::as_const(order)) {
-        const Title &t = m_titles[id];
-        if (!t.isSeries)
+        if (m_warmSkip && m_warmSkip(id)) {
+            ++skipped;
             continue;
-        for (const MediaFile &f : t.files)
-            jobs << QStringLiteral("%1/ep/%2/%3").arg(id).arg(f.season).arg(f.episode);
+        }
+        m_warmBase << id + QStringLiteral("/backdrop");
     }
-    TIMING("thumbnail warm-up queued: %d jobs", int(jobs.size()));
-    m_thumbs->warmUp(jobs);
+    m_warmSeasonJobs.clear(); // files may have changed: seasons are queued again when shown
+    m_warmedSeasons.clear();
+    TIMING("thumbnail warm-up queued: %d jobs (%d titles skipped)", int(m_warmBase.size()), skipped);
+    pushWarmUp();
+}
+
+void Library::requeueWarmUp()
+{
+    if (m_haveScanned)
+        queueWarmUp();
+}
+
+// ThumbnailProvider::warmUp() replaces its queue, so season jobs go first, then the backdrop list (jobs that
+// already ran find their frame cached and return at once).
+void Library::pushWarmUp()
+{
+    if (m_thumbs)
+        m_thumbs->warmUp(m_warmSeasonJobs + m_warmBase);
+}
+
+void Library::warmSeason(const QString &id, int season)
+{
+    if (!m_thumbs || qEnvironmentVariableIntValue("QTFLIX_NO_WARMUP") > 0)
+        return;
+    const Title *t = findTitle(id);
+    if (!t || !t->isSeries)
+        return;
+    const QString key = id + QLatin1Char('/') + QString::number(season);
+    if (m_warmedSeasons.contains(key))
+        return;
+    m_warmedSeasons.insert(key);
+    QStringList jobs;
+    for (const MediaFile &f : t->files) {
+        if (f.season != season)
+            continue;
+        if (!episodeOverlay(id, f.season, f.episode).value(QStringLiteral("stillFile")).toString().isEmpty())
+            continue; // metadata still: nothing to grab
+        jobs << QStringLiteral("%1/ep/%2/%3").arg(id).arg(f.season).arg(f.episode);
+    }
+    if (jobs.isEmpty())
+        return;
+    m_warmSeasonJobs = jobs + m_warmSeasonJobs;
+    if (m_warmSeasonJobs.size() > 300) // older requests drop out first
+        m_warmSeasonJobs.resize(300);
+    pushWarmUp();
 }
 
 // Progress entries of files that were removed from a library folder are dropped (entries of files outside
@@ -2647,6 +3243,8 @@ void Library::pruneProgress()
             ++it;
         }
     }
-    if (removed)
-        scheduleSave();
+    if (removed) {
+        m_resumeCache.clear();
+        scheduleSave(kStateSaveMs);
+    }
 }

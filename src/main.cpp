@@ -5,10 +5,45 @@
 #include <QIcon>
 #include <QQuickWindow>
 #include <QTimer>
+#include <QFile>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QStandardPaths>
 
 #include "library.h"
 #include "thumbnailprovider.h"
 #include "tmdb.h"
+
+// Dev hook QTFLIX_SELFTEST=progress (run it twice, headless): the first run sets progress on the first title,
+// checks the models and the file written by flushProgress(), then quits with a newer position that only the
+// shutdown path writes; the second run checks that position was restored and clears it again.
+static void selfTestProgress(Library &lib)
+{
+    const QString path = lib.allTitles()->get(0).value(QStringLiteral("path")).toString();
+    const QString id = lib.titleIdForPath(path);
+    auto fail = [](const char *what) { qWarning("[selftest] FAILED: %s", what); QCoreApplication::exit(2); };
+    if (path.isEmpty())
+        return fail("library is empty");
+    if (lib.position(path) == 43000) {
+        lib.clearProgress(path);
+        qInfo("[selftest] progress restored after restart: OK (cleared again)");
+        QTimer::singleShot(0, qApp, &QCoreApplication::quit);
+        return;
+    }
+    lib.setProgress(path, 42000, 100000);
+    if (!lib.continueWatching()->ids().contains(id) || lib.title(id).value(QStringLiteral("progress")).toDouble() != 0.42)
+        return fail("models not updated");
+    lib.flushProgress();
+    QTimer::singleShot(500, qApp, [&lib, path, fail] {
+        QFile f(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/watchstate.json"));
+        const QJsonObject o = f.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(f.readAll()).object() : QJsonObject();
+        if (o.value(QStringLiteral("progress")).toObject().value(path).toObject().value(QStringLiteral("positionMs")).toInt() != 42000)
+            return fail("flushProgress() did not write watchstate.json");
+        lib.setProgress(path, 43000, 100000); // not flushed: written by the shutdown path
+        qInfo("[selftest] progress saved by flushProgress(): OK; quitting with an unsaved position");
+        QCoreApplication::quit();
+    });
+}
 
 int main(int argc, char *argv[])
 {
@@ -35,6 +70,9 @@ int main(int argc, char *argv[])
     const QString root = qEnvironmentVariable("QTFLIX_ROOT", "Main");
     engine.loadFromModule("QtFlix", root);
     library.rescan();
+    if (qEnvironmentVariable("QTFLIX_SELFTEST") == QLatin1String("progress"))
+        QObject::connect(&library, &Library::libraryChanged, &app, [&library] { selfTestProgress(library); },
+                         Qt::SingleShotConnection);
 
     const QString shot = qEnvironmentVariable("QTFLIX_SCREENSHOT");
     if (!shot.isEmpty()) {
