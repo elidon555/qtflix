@@ -23,6 +23,15 @@ sudo apt install cmake ninja-build qt6-base-dev qt6-declarative-dev qt6-multimed
 ./lint.sh                            # qmllint (+ clang-tidy / clazy if installed)
 ```
 
+## Install (app menu shortcut)
+
+```
+./install.sh              # builds and installs to ~/.local, no sudo; QtFlix shows up in your app menu
+./install.sh --deb        # builds build/qtflix_<ver>_amd64.deb and installs it with apt
+./install.sh --system     # installs to /usr/local for all users
+./install.sh --uninstall  # removes the ~/.local install (add --system for /usr/local)
+```
+
 Default library folders are `~/Videos` and `~/Downloads`. Change them in the avatar menu under Settings.
 Folders are watched, so new files show up without a rescan.
 

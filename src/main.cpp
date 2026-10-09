@@ -17,6 +17,8 @@ int main(int argc, char *argv[])
     QGuiApplication::setOrganizationName("qtflix");
     QGuiApplication::setApplicationDisplayName("QtFlix");
     QGuiApplication app(argc, argv);
+    QGuiApplication::setDesktopFileName("qtflix"); // matches packaging/qtflix.desktop (taskbar icon on Wayland)
+    QGuiApplication::setWindowIcon(QIcon(":/assets/mark.svg"));
     QQuickStyle::setStyle("Basic");
 
     QSurfaceFormat fmt = QSurfaceFormat::defaultFormat();
@@ -28,6 +30,7 @@ int main(int argc, char *argv[])
     auto *thumbs = new ThumbnailProvider(&library); // engine takes ownership
 
     QQmlApplicationEngine engine;
+    engine.addImportPath("qrc:/"); // module is embedded at :/QtFlix (RESOURCE_PREFIX /), so it loads outside build/ too
     engine.addImageProvider("thumbs", thumbs);
     // Library and Tmdb are QML_SINGLETONs in module QtFlix (see their headers); instances created above.
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed, &app,

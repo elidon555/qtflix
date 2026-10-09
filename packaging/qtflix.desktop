@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=QtFlix
+GenericName=Video Player
+Comment=Streaming-style player for the videos on your disk
+Exec=qtflix
+Icon=qtflix
+Terminal=false
+Categories=AudioVideo;Video;Player;Qt;
+Keywords=movies;series;tv;video;player;
+StartupWMClass=qtflix

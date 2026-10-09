@@ -43,7 +43,24 @@ target_include_directories(qtflix PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(qtflix PRIVATE
     Qt6::Core Qt6::Gui Qt6::Quick Qt6::Qml Qt6::QuickControls2 Qt6::Multimedia Qt6::Svg Qt6::Concurrent Qt6::Network)
 
-install(TARGETS qtflix RUNTIME DESTINATION bin)
+include(GNUInstallDirs)
+install(TARGETS qtflix RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES packaging/qtflix.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+install(FILES assets/mark.svg DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps RENAME qtflix.svg)
+
+# .deb package: `cpack --config build/CPackConfig.cmake -G DEB` (or ./install.sh --deb)
+set(CPACK_PACKAGE_NAME qtflix)
+set(CPACK_PACKAGE_CONTACT "elidon555")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Streaming-style player for local video files")
+set(CPACK_PACKAGING_INSTALL_PREFIX /usr)
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+set(CPACK_DEBIAN_PACKAGE_SECTION video)
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "ffmpeg, fonts-inter, qml6-module-qtquick, qml6-module-qtquick-controls, \
+qml6-module-qtquick-layouts, qml6-module-qtquick-window, qml6-module-qtquick-templates, qml6-module-qtquick-effects, \
+qml6-module-qtquick-shapes, qml6-module-qtquick-dialogs, qml6-module-qtqml-workerscript, qml6-module-qtmultimedia, \
+qml6-module-qtcore, qml6-module-qt5compat-graphicaleffects, libqt6svg6")
+include(CPack)
 
 # ---------------------------------------------------------------------------
 # Lint: `ninja -C build lint`  (qmllint always; clang-tidy / clazy when installed)
