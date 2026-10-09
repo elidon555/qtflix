@@ -223,6 +223,7 @@ void Tmdb::metaLoaded(const QHash<QString, QJsonObject> &all)
     m_metaLoaded = true;
     qCDebug(lcTmdb) << "meta cache loaded:" << all.size() << "titles";
     if (std::exchange(m_syncWanted, false)) onLibraryChanged();
+    if (m_jobs.isEmpty()) emit idle(); // expectsArtwork() answers from the cache from now on
 }
 
 void Tmdb::ioThen(std::function<bool()> work, std::function<void(bool)> then)

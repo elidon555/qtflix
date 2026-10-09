@@ -249,7 +249,6 @@ private:
     qint64 m_cacheDirtySince = 0;
     QThreadPool m_ioPool;                    // one thread: JSON serialization + file writes, in order
     std::function<bool(const QString &)> m_warmSkip;
-    QStringList m_warmBase;                  // backdrop jobs of the last warm-up
     QStringList m_warmSeasonJobs;            // episode stills asked for by warmSeason(), newest first
     QSet<QString> m_warmedSeasons;           // "id/season" already queued this session
     static inline Library *s_instance = nullptr;

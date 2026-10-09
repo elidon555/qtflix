@@ -84,7 +84,7 @@ signals:
     void statsChanged();
     void statusChanged();
     void searchResults(const QVariantList &results);
-    void idle(); // C++ only: a fetch batch finished (nothing queued or running any more)
+    void idle(); // C++ only: nothing queued or running, expectsArtwork() answers may have changed (batch done, cache loaded)
 
 private:
     Library *m_lib;

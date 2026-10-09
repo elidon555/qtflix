@@ -634,6 +634,7 @@ void runProbe(Probe &p, const QString &exe)
 {
     QProcess proc;
     proc.setProcessChannelMode(QProcess::SeparateChannels);
+    proc.setChildProcessModifier([] { if (::nice(10) == -1) {} }); // up to probeThreads() run at once: stay behind playback
     proc.start(exe, {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-select_streams"),
                      QStringLiteral("v:0"), QStringLiteral("-show_entries"),
                      QStringLiteral("stream=codec_name,width,height:format=duration"), QStringLiteral("-of"),
@@ -3162,39 +3163,40 @@ void Library::queueWarmUp()
 {
     if (!m_thumbs || qEnvironmentVariableIntValue("QTFLIX_NO_WARMUP") > 0)
         return;
-    QStringList order;
-    if (m_titles.contains(m_featuredId))
-        order << m_featuredId;
-    for (const QString &id : std::as_const(m_orderedIds))
-        if (id != m_featuredId)
-            order << id;
-    m_warmBase.clear();
-    int skipped = 0;
-    for (const QString &id : std::as_const(order)) {
-        if (m_warmSkip && m_warmSkip(id)) {
-            ++skipped;
-            continue;
-        }
-        m_warmBase << id + QStringLiteral("/backdrop");
-    }
     m_warmSeasonJobs.clear(); // files may have changed: seasons are queued again when shown
     m_warmedSeasons.clear();
-    TIMING("thumbnail warm-up queued: %d jobs (%d titles skipped)", int(m_warmBase.size()), skipped);
     pushWarmUp();
 }
 
+// The skip predicate's answers changed (e.g. a TMDB batch finished): rebuild the backdrop list, keeping the
+// season jobs asked for since the last scan.
 void Library::requeueWarmUp()
 {
-    if (m_haveScanned)
-        queueWarmUp();
+    if (m_haveScanned && m_thumbs && qEnvironmentVariableIntValue("QTFLIX_NO_WARMUP") <= 0)
+        pushWarmUp();
 }
 
 // ThumbnailProvider::warmUp() replaces its queue, so season jobs go first, then the backdrop list (jobs that
 // already ran find their frame cached and return at once).
 void Library::pushWarmUp()
 {
-    if (m_thumbs)
-        m_thumbs->warmUp(m_warmSeasonJobs + m_warmBase);
+    QStringList order;
+    if (m_titles.contains(m_featuredId))
+        order << m_featuredId;
+    for (const QString &id : std::as_const(m_orderedIds))
+        if (id != m_featuredId)
+            order << id;
+    QStringList base;
+    int skipped = 0;
+    for (const QString &id : std::as_const(order)) {
+        if (m_warmSkip && m_warmSkip(id)) {
+            ++skipped;
+            continue;
+        }
+        base << id + QStringLiteral("/backdrop");
+    }
+    TIMING("thumbnail warm-up queued: %d jobs (%d titles skipped)", int(base.size()), skipped);
+    m_thumbs->warmUp(m_warmSeasonJobs + base);
 }
 
 void Library::warmSeason(const QString &id, int season)
@@ -3218,10 +3220,10 @@ void Library::warmSeason(const QString &id, int season)
     }
     if (jobs.isEmpty())
         return;
-    m_warmSeasonJobs = jobs + m_warmSeasonJobs;
+    m_warmSeasonJobs = jobs + m_warmSeasonJobs; // kept so requeueWarmUp() doesn't drop them
     if (m_warmSeasonJobs.size() > 300) // older requests drop out first
         m_warmSeasonJobs.resize(300);
-    pushWarmUp();
+    m_thumbs->prependWarmUp(jobs);
 }
 
 // Progress entries of files that were removed from a library folder are dropped (entries of files outside

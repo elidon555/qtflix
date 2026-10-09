@@ -58,6 +58,10 @@ int main(int argc, char *argv[])
     Library library(nullptr);
     Tmdb tmdb(&library);                            // declared before the engine so it outlives QML
     auto *thumbs = new ThumbnailProvider(&library); // engine takes ownership
+    // Thumbnail warm-up skips titles TMDB will give artwork; re-evaluated whenever TMDB's answers may change.
+    library.setWarmUpSkip([&tmdb](const QString &id) { return tmdb.expectsArtwork(id); });
+    QObject::connect(&tmdb, &Tmdb::idle, &library, &Library::requeueWarmUp);
+    QObject::connect(&tmdb, &Tmdb::apiKeyChanged, &library, &Library::requeueWarmUp);
 
     QQmlApplicationEngine engine;
     engine.addImportPath("qrc:/"); // module is embedded at :/QtFlix (RESOURCE_PREFIX /), so it loads outside build/ too
