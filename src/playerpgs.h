@@ -1,13 +1,17 @@
 #pragma once
-#include <QQuickPaintedItem>
+#include <QQuickItem>
+#include <QHash>
 #include <QImage>
 #include <QRect>
 #include <QVector>
 #include <QVariantList>
 #include <QPointer>
+#include <memory>
 #include <qqml.h>
 
 class QProcess;
+class QTimer;
+class PgsParser;
 
 // One object placed on the PGS canvas, still RLE-encoded (decoded lazily when its cue is shown).
 struct PgsObject {
@@ -33,25 +37,28 @@ struct PgsCue {
 // VideoOutput.contentRect.
 //
 // - Setting `file` probes the subtitle streams with ffprobe (async) and fills `streams`.
-// - Setting `stream` (ordinal among the file's subtitle streams, -1 = off) copies that stream out with
-//   `ffmpeg -map 0:s:<n> -c copy -f sup` (no decoding, cached under CacheLocation/pgs/), parses the PGS
-//   segments on a worker thread and draws the cue for `positionMs`.
+// - Setting `stream` (ordinal among the file's subtitle streams, -1 = off) copies every PGS stream of the
+//   file out in one pass, `ffmpeg -map 0:s:<a> -c copy -f sup a.part -map 0:s:<b> ...` (no decoding, idle
+//   I/O priority, cached under CacheLocation/pgs/), and parses the selected one on a worker thread while
+//   it is still being written, so the first cues show long before the pass reaches the end of the file.
+// - Each object of the current cue becomes one scene graph texture of its own size, scaled on the GPU;
+//   no node at all while no cue is on screen.
 // - The PGS canvas (usually 1920x1080) is fitted to the video width and centred on the video, the way a
 //   Blu-ray player shows it; `lift` raises a cue only when it would sit under the player controls.
-class PgsSubtitles : public QQuickPaintedItem
+class PgsSubtitles : public QQuickItem
 {
     Q_OBJECT
     QML_ELEMENT
-    Q_PROPERTY(QString file READ file WRITE setFile NOTIFY fileChanged)
-    Q_PROPERTY(int stream READ stream WRITE setStream NOTIFY streamChanged)
-    Q_PROPERTY(qint64 positionMs READ positionMs WRITE setPositionMs NOTIFY positionMsChanged)
-    Q_PROPERTY(QRectF videoRect READ videoRect WRITE setVideoRect NOTIFY videoRectChanged)
-    Q_PROPERTY(qreal lift READ lift WRITE setLift NOTIFY liftChanged)
-    Q_PROPERTY(bool streamsKnown READ streamsKnown NOTIFY streamsChanged)
-    Q_PROPERTY(QVariantList streams READ streams NOTIFY streamsChanged) // [{codec, language, title, pgs}]
-    Q_PROPERTY(bool loading READ loading NOTIFY stateChanged)
-    Q_PROPERTY(bool ready READ ready NOTIFY stateChanged)
-    Q_PROPERTY(int cueCount READ cueCount NOTIFY stateChanged)
+    Q_PROPERTY(QString file READ file WRITE setFile NOTIFY fileChanged FINAL)
+    Q_PROPERTY(int stream READ stream WRITE setStream NOTIFY streamChanged FINAL)
+    Q_PROPERTY(qint64 positionMs READ positionMs WRITE setPositionMs NOTIFY positionMsChanged FINAL)
+    Q_PROPERTY(QRectF videoRect READ videoRect WRITE setVideoRect NOTIFY videoRectChanged FINAL)
+    Q_PROPERTY(qreal lift READ lift WRITE setLift NOTIFY liftChanged FINAL)
+    Q_PROPERTY(bool streamsKnown READ streamsKnown NOTIFY streamsChanged FINAL)
+    Q_PROPERTY(QVariantList streams READ streams NOTIFY streamsChanged FINAL) // [{codec, language, title, pgs}]
+    Q_PROPERTY(bool loading READ loading NOTIFY stateChanged FINAL)
+    Q_PROPERTY(bool ready READ ready NOTIFY stateChanged FINAL)
+    Q_PROPERTY(int cueCount READ cueCount NOTIFY stateChanged FINAL)
 public:
     explicit PgsSubtitles(QQuickItem *parent = nullptr);
     ~PgsSubtitles() override;
@@ -75,8 +82,6 @@ public:
     // True when subtitle stream `ordinal` is PGS and this item will render it.
     Q_INVOKABLE bool isPgs(int ordinal) const;
 
-    void paint(QPainter *painter) override;
-
     // Exposed for tests.
     static QVector<PgsCue> parseSup(const QByteArray &data);
     static QImage decodeObject(const PgsObject &obj, const QVector<QRgb> &palette);
@@ -90,11 +95,18 @@ signals:
     void streamsChanged();
     void stateChanged();
 
+protected:
+    QSGNode *updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *) override;
+    void geometryChange(const QRectF &newGeometry, const QRectF &oldGeometry) override;
+
 private:
     void probe();
     void load();
+    void extract(const QList<int> &ordinals);
     void stopProcesses();
-    void setCues(QVector<PgsCue> cues, quint64 gen);
+    void resetCues();
+    void parseMore();
+    void setCues(QVector<PgsCue> cues);
     void updateCurrent();
     QString cachePathFor(int ordinal) const;
 
@@ -108,8 +120,21 @@ private:
     bool m_loading = false;
     quint64 m_gen = 0;                // bumps on every file/stream change; stale results are dropped
     QPointer<QProcess> m_probe;
-    QPointer<QProcess> m_extract;
+    QPointer<QProcess> m_extract;     // one pass for all PGS streams of m_file
+    QHash<int, QString> m_extracting; // ordinal -> .sup path being written by m_extract
+    QTimer *m_poll = nullptr;         // re-reads the growing .part of the selected stream
+
+    // Incremental parse of the selected stream (one worker task at a time).
+    std::shared_ptr<PgsParser> m_parser;
+    QString m_parsePath;              // file the parser reads from (.part while extracting)
+    qint64 m_parseOffset = 0;         // bytes of m_parsePath already fed to the parser
+    bool m_parseBusy = false;
+    bool m_parseAgain = false;
+
     QVector<PgsCue> m_cues;
     int m_current = -1;
+    qint64 m_currentStart = -1;       // startMs of the cue in m_images (survives cue list updates)
     QVector<QPair<QRect, QImage>> m_images; // decoded objects of the current cue, in canvas coordinates
+    QSize m_canvas;                   // canvas of the current cue
+    bool m_imagesDirty = false;       // m_images changed since the last updatePaintNode()
 };

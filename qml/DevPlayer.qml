@@ -12,10 +12,14 @@ import QtFlix
 //   --hover=<0..1>       show the timeline hover preview (trickplay) at that fraction
 //   --flash              keyboard-style +10 s with center flash
 //   --pause=<ms>         pause after <ms>;  --seek=<ms> seek after load;  --next  jump to 12 s before the end
-//   --handoff=<ms>       call playNext() after <ms> (seamless next-episode swap test)
+//   --handoff=<ms>       call playNext() after <ms> (seamless next-episode swap test), or switch to
+//                        --file2=<path> when given
 //   --quit=<ms>          close the player (like the back arrow) after <ms>
 //   --dismiss=<ms>       press "Watch Credits" on the next-episode card after <ms>
-//   --fps                log delivered video frames/s;  --renders  log rendered window frames/s (idle check)
+//   --fps                log delivered video frames/s, the active video decoder (hw/sw) and where frames
+//                        live;  --renders  log rendered window frames/s (idle check)
+//   --subtrack=<n>       pick subtitle choice n (1 = first embedded track) once the tracks are known
+//   --late=<ms>          open the file only after <ms> (library scanned);  --ttff  log ms until the first frame
 ApplicationWindow {
     id: win
     width: sizeArg(0, 1600); height: sizeArg(1, 900)
@@ -41,19 +45,38 @@ ApplicationWindow {
     readonly property string moviePath: "/home/neziri/Downloads/Minority Report 2002 REMASTERED 1080p (Multi) BluRay HEVC x265 5.1 BONE.mkv"
     readonly property string episodePath: "/home/neziri/Videos/Person of Interest (2011) Season 5 S05 (1080p BluRay x265 HEVC 10bit AAC 5.1 RZeroX)/Person of Interest (2011) - S05E05 - ShotSeeker (1080p BluRay x265 RZeroX).mkv"
 
+    readonly property string filePath: arg("file") !== "" ? arg("file") : (arg("episode") !== "" ? episodePath : moviePath)
+
     Player {
         id: player
-        path: win.arg("file") !== "" ? win.arg("file") : (win.arg("episode") !== "" ? win.episodePath : win.moviePath)
+        path: win.arg("late") !== "" ? "" : win.filePath
         forceControls: win.arg("controls") !== ""
         forceHoverFraction: win.arg("hover") !== "" ? parseFloat(win.arg("hover")) : -1
         onClosed: Qt.quit()
     }
 
     // --fps: print delivered video frames per second (smoothness check)
+    // --ttff: time from opening the file (start-up or --late) to the first delivered video frame
     property int frames: 0
+    property string frameInfo: ""
+    DecoderProbe { id: probe; active: win.arg("fps") !== "" }
+    property double openedAt: Date.now()
+    property bool firstFrameSeen: false
     Connections {
-        target: win.arg("fps") !== "" ? player.videoOutput.videoSink : null
-        function onVideoFrameChanged() { win.frames++ }
+        target: win.arg("fps") !== "" || win.arg("ttff") !== "" ? player.videoOutput.videoSink : null
+        function onVideoFrameChanged() {
+            win.frames++
+            if (win.frameInfo === "" && probe.active) win.frameInfo = probe.describeFrame(player.videoOutput.videoSink)
+            if (!win.firstFrameSeen && win.arg("ttff") !== "") {
+                win.firstFrameSeen = true
+                console.log("ttff", Date.now() - win.openedAt, "ms")
+            }
+        }
+    }
+    Timer {
+        interval: win.arg("late") !== "" ? parseInt(win.arg("late")) : 0
+        running: win.arg("late") !== ""
+        onTriggered: { win.openedAt = Date.now(); player.path = win.filePath }
     }
     // --renders: rendered window frames per second (should be 0 while paused with hidden controls)
     property int swaps: 0
@@ -66,8 +89,8 @@ ApplicationWindow {
         onTriggered: {
             console.log("fps", win.frames, "renders", win.swaps, "pos", player.mediaPlayer.position,
                         "status", player.mediaPlayer.mediaStatus, "state", player.mediaPlayer.playbackState, "controls", player.controlsOpacity,
-                        "trick", player.trickplay.ready)
-            win.frames = 0; win.swaps = 0
+                        "trick", player.trickplay.ready, "decoder", probe.decoder || "?", "frames", win.frameInfo)
+            win.frames = 0; win.swaps = 0; win.frameInfo = ""
         }
     }
     Timer {
@@ -82,6 +105,7 @@ ApplicationWindow {
                 player.sidecars = [{ path: win.arg("sub"), label: "Test (sidecar)" }]
                 player.chooseSubtitle(player.subtitleLabels.length - 1, false)
             }
+            if (win.arg("subtrack") !== "") player.chooseSubtitle(parseInt(win.arg("subtrack")), false)
             if (win.arg("flash") !== "") player.seekBy(10000, true)
             if (win.arg("next") !== "") player.seekTo(player.durationMs - 12000)
         }
@@ -104,6 +128,6 @@ ApplicationWindow {
     Timer {
         interval: win.arg("handoff") !== "" ? parseInt(win.arg("handoff")) : 0
         running: win.arg("handoff") !== ""
-        onTriggered: player.playNext(true)
+        onTriggered: if (win.arg("file2") !== "") player.playPath(win.arg("file2")); else player.playNext(true)
     }
 }
