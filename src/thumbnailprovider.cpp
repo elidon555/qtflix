@@ -2,12 +2,14 @@
 #include "library.h"
 
 #include <QAtomicInt>
+#include <QCryptographicHash>
 #include <QDebug>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFileInfo>
 #include <QFont>
 #include <QFontMetrics>
+#include <QHash>
 #include <QImageReader>
 #include <QLinearGradient>
 #include <QMutex>
@@ -15,37 +17,79 @@
 #include <QProcess>
 #include <QSet>
 #include <QStandardPaths>
-#include <QWaitCondition>
+#include <QThread>
+#include <QTimer>
+#include <algorithm>
 #include <deque>
 #include <functional>
 
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
+#ifdef Q_OS_LINUX
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
-// The provider runs requestImageResponse() on QML's image reader thread and the actual work on m_pool
-// (max 3 threads, so at most 3 ffmpeg processes run at once). Library data is only read through
-// Library::thumbInfo(), which copies the needed fields under Library::m_mutex.
-//
-// Two kinds of work share the pool:
-//  - live QML requests (priority 10), started immediately;
-//  - warm-up jobs queued by the Library after a scan. They are started one by one, only while no live
-//    request is pending, and at most 2 at a time, so a live request always finds a free thread.
+// The provider runs requestImageResponse() on QML's image reader thread and the actual work on two pools.
+// Library data is only read through Library::thumbInfo(), which copies the needed fields under
+// Library::m_mutex.
+//  - m_pool (decode pool, ~one thread per core): every live QML request starts here and is answered from
+//    artwork files, the disk cache or a remembered failure, without ever waiting for ffmpeg;
+//  - m_grabPool (3 threads, so at most 3 ffmpeg processes run at once): frame grabs. A live request that
+//    misses the cache is handed over (priority 10). Requests for a frame that is already being grabbed
+//    don't block a thread: they are attached to the grab in flight and answered when it completes.
+//    Warm-up jobs queued by the Library after a scan run here too: started one by one, only while no
+//    live request is pending, and at most 2 at a time, so a live grab always finds a free thread.
 // Only ffmpeg frame grabs are cached on disk (CacheLocation/thumbs/<id>-<kind>.jpg); artwork files
 // (posterFile/backdropFile/episode stills) are decoded directly at the requested size.
+
+class ThumbResponse : public QQuickImageResponse
+{
+public:
+    QQuickTextureFactory *textureFactory() const override
+    {
+        // hand the pixels over: the provider keeps no reference once QML has the texture factory
+        QImage img;
+        img.swap(m_image);
+        return QQuickTextureFactory::textureFactoryForImage(img);
+    }
+    void cancel() override { m_cancelled.storeRelaxed(1); }
+
+    mutable QImage m_image;
+    QAtomicInt m_cancelled{0};
+};
+
+struct Request {
+    QString titleId;
+    QString kind = QStringLiteral("card"); // card | backdrop | ep
+    int season = -1, episode = -1;
+};
+
+// a live request waiting for its image
+struct Pending {
+    ThumbResponse *resp = nullptr;
+    Request req;
+    QSize requested;
+    QElapsedTimer timer;
+};
+
+using InfoFn = std::function<QVariantMap(const QString &, int, int)>;
 
 struct ThumbShared {
     QMutex mutex;
     std::deque<QString> warmQueue;
-    int live = 0;        // live requests queued or running
+    int live = 0;        // live requests queued, running or waiting for a grab
     int warmActive = 0;  // warm-up jobs running
     int warmTotal = 0, warmDone = 0;
     QElapsedTimer warmTimer;
+    // frame grabs in flight by lock key (card and backdrop share "<id>-frame"), with the live requests
+    // waiting for them
+    QHash<QString, QList<Pending>> inFlight;
 
-    // per-cache-key exclusion, so a live request waits for a warm-up job producing the same frame
-    QMutex keyMutex;
-    QWaitCondition keyCond;
-    QSet<QString> busyKeys;
+    InfoFn info;
+    QThreadPool *decodePool = nullptr;
+    QThreadPool *grabPool = nullptr;
 };
 struct ThumbnailProvider::Shared : ThumbShared {};
 
@@ -59,8 +103,10 @@ bool timing()
     return on;
 }
 
+enum class GrabStatus { Ok, NoFrame, Error, Timeout };
+
 QMutex g_failedMutex;
-QSet<QString> g_failedFrames; // "path@sec" that ffmpeg could not decode in this session
+QHash<QString, GrabStatus> g_failedFrames; // "path@sec.ss" that ffmpeg could not decode in this session
 
 QString thumbsDir()
 {
@@ -70,6 +116,57 @@ QString thumbsDir()
         return d;
     }();
     return dir;
+}
+
+// Markers of files ffmpeg could not get a frame from, so broken files aren't retried on every launch.
+// Named by a hash of path + size + mtime + grab position (a changed file gets a new chance), the content
+// is the video path (for pruning). They expire after 30 days (e.g. a newer ffmpeg may handle the file).
+QString failedDir()
+{
+    static const QString dir = [] {
+        const QString d = thumbsDir() + QStringLiteral("/failed");
+        QDir().mkpath(d);
+        return d;
+    }();
+    return dir;
+}
+
+constexpr qint64 kFailedMarkerSecs = 30 * 24 * 3600;
+
+QString failMarker(const QString &file, double fraction)
+{
+    const QFileInfo fi(file);
+    if (file.isEmpty() || !fi.exists())
+        return {};
+    const QByteArray key = file.toUtf8() + '\n' + QByteArray::number(fi.size()) + '\n'
+                           + QByteArray::number(fi.lastModified().toMSecsSinceEpoch()) + '\n'
+                           + QByteArray::number(fraction, 'f', 2);
+    return failedDir() + QLatin1Char('/')
+           + QString::fromLatin1(QCryptographicHash::hash(key, QCryptographicHash::Sha1).toHex().left(24))
+           + QStringLiteral(".fail");
+}
+
+bool grabFailedBefore(const QString &file, double fraction)
+{
+    const QString m = failMarker(file, fraction);
+    if (m.isEmpty())
+        return false;
+    const QFileInfo mi(m);
+    return mi.exists() && mi.lastModified().secsTo(QDateTime::currentDateTime()) < kFailedMarkerSecs;
+}
+
+void rememberGrabFailed(const QString &file, double fraction)
+{
+    const QString m = failMarker(file, fraction);
+    QFile f(m);
+    if (!m.isEmpty() && f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        f.write(file.toUtf8());
+}
+
+// the position of a kind's frame (card and backdrop use the same frame)
+double grabFraction(const QString &kind)
+{
+    return kind == QLatin1String("ep") ? 0.35 : 0.20;
 }
 
 QSize defaultSize(const QString &kind)
@@ -247,28 +344,38 @@ QString vaapiDevice()
     return dev;
 }
 
-enum class GrabStatus { Ok, NoFrame, Error };
-
 // One ffmpeg run. NoFrame = ffmpeg ran fine but nothing decodable at that position (e.g. a webm without
-// cues seeked past its only keyframe); Error = ffmpeg failed / timed out (worth retrying without VA-API).
+// cues seeked past its only keyframe); Error = ffmpeg failed (worth retrying without VA-API); Timeout =
+// ffmpeg did not start or finish in time / shutdown (says nothing about the file).
 QImage runFfmpeg(const QString &exe, const QString &file, double sec, bool hw, GrabStatus *status)
 {
-    *status = GrabStatus::Error;
+    *status = GrabStatus::Timeout;
     QStringList args = {QStringLiteral("-hide_banner"), QStringLiteral("-nostdin"), QStringLiteral("-v"),
                         QStringLiteral("error")};
     if (hw)
         args << QStringLiteral("-hwaccel") << QStringLiteral("vaapi") << QStringLiteral("-hwaccel_device")
              << vaapiDevice();
-    // keyframe-only decoding + fast (non-accurate) input seek: we get the keyframe at/before `sec`
+    // keyframe-only decoding + fast (non-accurate) input seek: we get the keyframe at/before `sec`;
+    // frames wider than 1280 are scaled down, smaller ones are kept as they are (never upscaled)
     args << QStringLiteral("-skip_frame") << QStringLiteral("nokey") << QStringLiteral("-threads")
          << QStringLiteral("2") << QStringLiteral("-noaccurate_seek") << QStringLiteral("-ss")
          << QString::number(sec, 'f', 2) << QStringLiteral("-i") << file << QStringLiteral("-an")
          << QStringLiteral("-sn") << QStringLiteral("-dn") << QStringLiteral("-frames:v") << QStringLiteral("1")
-         << QStringLiteral("-vf") << QStringLiteral("scale=1280:-2") << QStringLiteral("-f")
+         << QStringLiteral("-vf") << QStringLiteral("scale='min(1280,iw)':-2") << QStringLiteral("-f")
          << QStringLiteral("image2pipe") << QStringLiteral("-c:v") << QStringLiteral("ppm") << QStringLiteral("pipe:1");
     QProcess proc;
     proc.setProcessChannelMode(QProcess::SeparateChannels);
     proc.setStandardErrorFile(QProcess::nullDevice());
+#ifdef Q_OS_LINUX
+    // Background work: idle I/O class (only gets the disk when nobody else wants it, e.g. a playing video)
+    // and a lower CPU priority. Runs in the child between fork and exec: plain syscalls only.
+    proc.setChildProcessModifier([] {
+        constexpr int ioprioWhoProcess = 1, ioprioClassIdle = 3, ioprioClassShift = 13;
+        ::syscall(SYS_ioprio_set, ioprioWhoProcess, 0, ioprioClassIdle << ioprioClassShift);
+        if (::nice(10) == -1) {
+        }
+    });
+#endif
     proc.start(exe, args);
     if (!proc.waitForStarted(5000))
         return {};
@@ -285,6 +392,7 @@ QImage runFfmpeg(const QString &exe, const QString &file, double sec, bool hw, G
         proc.waitForFinished(1000);
         return {};
     }
+    *status = GrabStatus::Error;
     if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0)
         return {};
     const QByteArray data = proc.readAllStandardOutput();
@@ -313,16 +421,20 @@ bool preferHw(const QString &codec, int height)
 
 // Grab one frame at `sec` seconds. Heavy streams try VA-API first (if it fails outright once while software
 // works, it is disabled for the rest of the session); everything else decodes in software.
-QImage grabFrame(const QString &file, double sec, bool hwFirst)
+QImage grabFrame(const QString &file, double sec, bool hwFirst, GrabStatus *status)
 {
     static const QString exe = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
+    *status = GrabStatus::Timeout; // no ffmpeg / no file: nothing learned about the file
     if (exe.isEmpty() || file.isEmpty() || !QFileInfo::exists(file))
         return {};
-    const QString key = file + QLatin1Char('@') + QString::number(int(sec));
+    const QString key = file + QLatin1Char('@') + QString::number(sec, 'f', 2);
     {
         QMutexLocker l(&g_failedMutex);
-        if (g_failedFrames.contains(key))
+        const auto it = g_failedFrames.constFind(key);
+        if (it != g_failedFrames.cend()) {
+            *status = it.value();
             return {};
+        }
     }
     QElapsedTimer t;
     t.start();
@@ -338,7 +450,7 @@ QImage grabFrame(const QString &file, double sec, bool hwFirst)
             g_hwMode.storeRelaxed(1);
     }
     // software: VA-API disabled/unavailable, or the VA-API run failed outright (not just "no frame here")
-    if (st == GrabStatus::Error && !g_shuttingDown.loadRelaxed()) {
+    if ((st == GrabStatus::Error || st == GrabStatus::Timeout) && !g_shuttingDown.loadRelaxed()) {
         img = runFfmpeg(exe, file, sec, false, &st);
         if (tryHw && mode == 0 && st == GrabStatus::Ok) { // only blame VA-API if software works
             g_hwMode.storeRelaxed(-1);
@@ -351,30 +463,44 @@ QImage grabFrame(const QString &file, double sec, bool hwFirst)
                qint64(t.elapsed()), usedHw ? "vaapi" : "sw", img.isNull() ? " FAILED" : "");
     if (img.isNull() && !g_shuttingDown.loadRelaxed()) {
         QMutexLocker l(&g_failedMutex);
-        g_failedFrames.insert(key);
+        g_failedFrames.insert(key, st);
     }
+    *status = img.isNull() ? st : GrabStatus::Ok;
     return img;
 }
 
-QImage grabAt(const QString &file, qint64 durationMs, double fraction, bool hw)
+// *definite is set when a null result says something about the file (ffmpeg ran and found nothing
+// usable), as opposed to timeouts / a missing ffmpeg / shutdown.
+QImage grabAt(const QString &file, qint64 durationMs, double fraction, bool hw, bool *definite)
 {
+    bool transient = false;
+    auto grab = [&](double at) {
+        GrabStatus st;
+        QImage img = grabFrame(file, at, hw, &st);
+        transient |= st == GrabStatus::Timeout;
+        return img;
+    };
     double sec = 60.0;
     if (durationMs > 0)
         sec = durationMs < 120000 ? durationMs * 0.10 / 1000.0 : durationMs * fraction / 1000.0;
-    QImage img = grabFrame(file, sec, hw);
-    // a fade / black scene would make a useless thumbnail (and fool the black-bar trimming): retry later once
+    QImage img = grab(sec);
+    // A fade / black scene would make a useless thumbnail (and fool the black-bar trimming): retry later once.
+    // (A single ffmpeg run producing both candidates would decode two frames for every grab; this second
+    // process only runs for the rare dark frame.)
     if (!img.isNull() && durationMs > 0 && !g_shuttingDown.loadRelaxed() && meanLuma(img) < 16) {
         const double later = sec + durationMs * 0.10 / 1000.0;
         if (later < durationMs / 1000.0 - 1.0) {
-            const QImage again = grabFrame(file, later, hw);
+            const QImage again = grab(later);
             if (!again.isNull() && meanLuma(again) > meanLuma(img))
                 img = again;
         }
     }
-    if (img.isNull() && sec > 0.5 && !g_shuttingDown.loadRelaxed())
-        img = grabFrame(file, durationMs > 0 ? 0.0 : 3.0, hw); // short/unknown-length file: try near the start
+    // nothing at that position (e.g. a short clip whose only keyframe is at 0): try near the start
+    if (img.isNull() && sec > 0.0 && !g_shuttingDown.loadRelaxed())
+        img = grab(durationMs > 0 ? 0.0 : 3.0);
     if (img.isNull() && !g_shuttingDown.loadRelaxed() && durationMs <= 0)
-        img = grabFrame(file, 0.0, hw);
+        img = grab(0.0);
+    *definite = img.isNull() && !transient && !g_shuttingDown.loadRelaxed();
     return trimBlackBorders(img);
 }
 
@@ -382,7 +508,8 @@ void saveCache(const QImage &img, const QString &path)
 {
     if (img.isNull())
         return;
-    const QString tmp = path + QStringLiteral(".part");
+    // per-thread temp name: a card may be derived from the backdrop cache by two threads at once
+    const QString tmp = path + QStringLiteral(".%1.part").arg(quintptr(QThread::currentThreadId()), 0, 16);
     if (img.save(tmp, "JPG", 88)) {
         QFile::remove(path);
         QFile::rename(tmp, path);
@@ -390,28 +517,6 @@ void saveCache(const QImage &img, const QString &path)
         QFile::remove(tmp);
     }
 }
-
-class ThumbResponse : public QQuickImageResponse
-{
-public:
-    QQuickTextureFactory *textureFactory() const override
-    {
-        // hand the pixels over: the provider keeps no reference once QML has the texture factory
-        QImage img;
-        img.swap(m_image);
-        return QQuickTextureFactory::textureFactoryForImage(img);
-    }
-    void cancel() override { m_cancelled.storeRelaxed(1); }
-
-    mutable QImage m_image;
-    QAtomicInt m_cancelled{0};
-};
-
-struct Request {
-    QString titleId;
-    QString kind = QStringLiteral("card"); // card | backdrop | ep
-    int season = -1, episode = -1;
-};
 
 Request parseId(const QString &rawId)
 {
@@ -452,70 +557,66 @@ QSize targetSize(const QSize &requested, const QString &kind)
     return def;
 }
 
-struct KeyLock {
-    ThumbShared *s;
-    QString key;
-    KeyLock(ThumbShared *sh, const QString &k) : s(sh), key(k)
-    {
-        QMutexLocker l(&s->keyMutex);
-        while (s->busyKeys.contains(key))
-            s->keyCond.wait(&s->keyMutex);
-        s->busyKeys.insert(key);
-    }
-    ~KeyLock()
-    {
-        QMutexLocker l(&s->keyMutex);
-        s->busyKeys.remove(key);
-        s->keyCond.wakeAll();
-    }
-};
-
-using InfoFn = std::function<QVariantMap(const QString &, int, int)>;
-
 bool cacheValid(const QString &file, const QDateTime &mtime)
 {
     const QFileInfo fi(file);
     return fi.exists() && fi.size() > 0 && (!mtime.isValid() || fi.lastModified() >= mtime);
 }
 
-QString frameCacheFile(const Request &r)
+QString frameCacheName(const QString &titleId, const QString &kind, int season, int episode)
 {
-    QString name = r.titleId + QLatin1Char('-') + r.kind;
-    if (r.kind == QLatin1String("ep"))
-        name += QStringLiteral("-%1-%2").arg(r.season).arg(r.episode);
-    return thumbsDir() + QLatin1Char('/') + name + QStringLiteral(".jpg");
+    QString name = titleId + QLatin1Char('-') + kind;
+    if (kind == QLatin1String("ep"))
+        name += QStringLiteral("-%1-%2").arg(season).arg(episode);
+    return name + QStringLiteral(".jpg");
 }
 
-// Produces the image for a request. With out == QSize() (warm-up) it only makes sure the disk cache is
-// filled and returns a null image.
-QImage produce(ThumbShared *shared, const Request &r, const QSize &out, const QAtomicInt *cancelled,
-               const InfoFn &info)
+QString frameCacheFile(const Request &r)
 {
-    const bool warm = !out.isValid();
-    const QVariantMap ti = info(r.titleId, r.kind == QLatin1String("ep") ? r.season : -1, r.episode);
-    if (ti.isEmpty())
-        return warm ? QImage() : placeholder(QString(), out);
-    const QString title = ti.value(QStringLiteral("title")).toString();
-    auto aborted = [&] { return g_shuttingDown.loadRelaxed() || (cancelled && cancelled->loadRelaxed()); };
-    if (aborted())
-        return warm ? QImage() : placeholder(title, out);
+    return thumbsDir() + QLatin1Char('/') + frameCacheName(r.titleId, r.kind, r.season, r.episode);
+}
 
-    const QString path = ti.value(QStringLiteral("path")).toString();
-    const qint64 dur = ti.value(QStringLiteral("durationMs")).toLongLong();
+// one frame grab per key: card and backdrop come from the same frame
+QString grabKey(const Request &r)
+{
+    return r.kind == QLatin1String("ep") ? frameCacheFile(r) : r.titleId + QStringLiteral("-frame");
+}
+
+// What a request gets when no frame can be grabbed: a backdrop falls back to the poster, everything
+// else to a placeholder with the title (episodes: "S1:E2" + episode title).
+QImage fallbackImage(const Request &r, const QVariantMap &ti, const QSize &out)
+{
     const QString poster = ti.value(QStringLiteral("poster")).toString();
-    const QString backdrop = ti.value(QStringLiteral("backdrop")).toString();
-    const QString still = ti.value(QStringLiteral("still")).toString();
-    const QDateTime mtime = ti.value(QStringLiteral("mtime")).toDateTime();
-    const bool hw = preferHw(ti.value(QStringLiteral("codec")).toString(), ti.value(QStringLiteral("height")).toInt());
+    if (r.kind == QLatin1String("backdrop") && !poster.isEmpty()) {
+        const QImage img = loadCover(poster, out);
+        if (!img.isNull())
+            return img;
+    }
+    QString text = ti.value(QStringLiteral("title")).toString();
+    if (r.kind == QLatin1String("ep")) {
+        const QString et = ti.value(QStringLiteral("episodeTitle")).toString();
+        text = r.season > 0 ? QStringLiteral("S%1:E%2").arg(r.season).arg(r.episode) : QStringLiteral("Extra");
+        if (!et.isEmpty())
+            text += QLatin1Char('\n') + et;
+    }
+    return placeholder(text, out);
+}
 
+// Everything that needs no ffmpeg: artwork files, the frame cache (a card is cut from a cached backdrop
+// frame) and remembered failures. Sets *hit = false when a frame grab is needed. With out == QSize()
+// (warm-up / re-check) nothing is decoded except to derive a card cache entry, and the image is null.
+QImage fromCache(const Request &r, const QVariantMap &ti, const QSize &out, bool *hit)
+{
+    *hit = true;
+    const bool warm = !out.isValid();
     // 1) artwork files: decode directly at the requested size
     QStringList art;
     if (r.kind == QLatin1String("card"))
-        art << poster << backdrop;
+        art << ti.value(QStringLiteral("poster")).toString() << ti.value(QStringLiteral("backdrop")).toString();
     else if (r.kind == QLatin1String("backdrop"))
-        art << backdrop;
+        art << ti.value(QStringLiteral("backdrop")).toString();
     else
-        art << still;
+        art << ti.value(QStringLiteral("still")).toString();
     for (const QString &a : std::as_const(art)) {
         if (a.isEmpty())
             continue;
@@ -527,129 +628,165 @@ QImage produce(ThumbShared *shared, const Request &r, const QSize &out, const QA
     }
 
     // 2) cached frame grab
+    const QDateTime mtime = ti.value(QStringLiteral("mtime")).toDateTime();
     const QString cacheFile = frameCacheFile(r);
     if (cacheValid(cacheFile, mtime))
         return warm ? QImage() : loadCover(cacheFile, out);
-
-    // 3) grab a frame (card and backdrop share the same frame and lock)
-    QImage base;
-    {
-        const bool frameKind = r.kind != QLatin1String("ep");
-        KeyLock lock(shared, frameKind ? r.titleId + QStringLiteral("-frame") : cacheFile);
-        if (cacheValid(cacheFile, mtime)) // somebody else made it while we waited
-            return warm ? QImage() : loadCover(cacheFile, out);
-        if (aborted())
-            return warm ? QImage() : placeholder(title, out);
-        const QSize cs = cacheSize(r.kind);
-        if (r.kind == QLatin1String("card")) {
-            Request bdReq = r;
-            bdReq.kind = QStringLiteral("backdrop");
-            const QString bdCache = frameCacheFile(bdReq);
-            QImage src;
-            if (cacheValid(bdCache, mtime))
-                src = loadImage(bdCache);
-            if (src.isNull()) {
-                src = grabAt(path, dur, 0.20, hw);
-                if (!src.isNull()) // also seed the backdrop cache from the same frame
-                    saveCache(coverCrop(src, cacheSize(QStringLiteral("backdrop"))), bdCache);
+    if (r.kind == QLatin1String("card")) {
+        Request bdReq = r;
+        bdReq.kind = QStringLiteral("backdrop");
+        const QString bdCache = frameCacheFile(bdReq);
+        if (cacheValid(bdCache, mtime)) {
+            const QImage base = coverCropNoUpscale(loadImage(bdCache), cacheSize(r.kind));
+            if (!base.isNull()) {
+                saveCache(base, cacheFile);
+                return warm ? QImage() : coverCropNoUpscale(base, out);
             }
-            if (!src.isNull())
-                base = coverCrop(src, cs);
-        } else if (r.kind == QLatin1String("backdrop")) {
-            QImage src = grabAt(path, dur, 0.20, hw);
-            if (src.isNull() && !poster.isEmpty() && !warm)
-                return loadCover(poster, out);
-            if (!src.isNull())
-                base = coverCrop(src, cs);
-        } else { // episode
-            const QImage src = grabAt(path, dur, 0.35, hw);
-            if (!src.isNull())
-                base = coverCrop(src, cs);
         }
-        if (!base.isNull())
-            saveCache(base, cacheFile);
     }
-    if (warm)
+
+    // 3) ffmpeg found nothing in this file before
+    if (grabFailedBefore(ti.value(QStringLiteral("path")).toString(), grabFraction(r.kind)))
+        return warm ? QImage() : fallbackImage(r, ti, out);
+    *hit = false;
+    return {};
+}
+
+// Grabs the frame for `r` with ffmpeg and fills the disk cache. Returns the cached image (cacheSize of
+// the kind, smaller for small sources) or null.
+QImage grabIntoCache(const Request &r, const QVariantMap &ti)
+{
+    const QString path = ti.value(QStringLiteral("path")).toString();
+    const qint64 dur = ti.value(QStringLiteral("durationMs")).toLongLong();
+    const bool hw = preferHw(ti.value(QStringLiteral("codec")).toString(), ti.value(QStringLiteral("height")).toInt());
+    const double fraction = grabFraction(r.kind);
+    bool definite = false;
+    const QImage src = grabAt(path, dur, fraction, hw, &definite);
+    if (src.isNull()) {
+        if (definite)
+            rememberGrabFailed(path, fraction);
         return {};
+    }
+    if (r.kind == QLatin1String("card")) { // also seed the backdrop cache from the same frame
+        Request bdReq = r;
+        bdReq.kind = QStringLiteral("backdrop");
+        saveCache(coverCropNoUpscale(src, cacheSize(bdReq.kind)), frameCacheFile(bdReq));
+    }
+    const QImage base = coverCropNoUpscale(src, cacheSize(r.kind));
+    saveCache(base, frameCacheFile(r));
+    return base;
+}
 
-    if (base.isNull()) {
-        QString text = title;
-        if (r.kind == QLatin1String("ep")) {
-            const QString et = ti.value(QStringLiteral("episodeTitle")).toString();
-            text = r.season > 0 ? QStringLiteral("S%1:E%2").arg(r.season).arg(r.episode) : QStringLiteral("Extra");
-            if (!et.isEmpty())
-                text += QLatin1Char('\n') + et;
+void pumpWarm(const std::shared_ptr<ThumbShared> &shared);
+
+// Answers a live request (on the QML side, the engine deletes the response after finished()).
+void deliver(const std::shared_ptr<ThumbShared> &shared, const Pending &p, QImage img)
+{
+    if (img.isNull())
+        img = placeholder(QString(), targetSize(p.requested, p.req.kind));
+    if (timing())
+        qDebug("[thumbs] %s/%s req %dx%d -> %dx%d in %lld ms", qPrintable(p.req.titleId), qPrintable(p.req.kind),
+               p.requested.width(), p.requested.height(), img.width(), img.height(), qint64(p.timer.elapsed()));
+    p.resp->m_image = std::move(img);
+    {
+        QMutexLocker l(&shared->mutex);
+        --shared->live;
+    }
+    emit p.resp->finished(); // the engine deletes resp after this; don't touch it afterwards
+    pumpWarm(shared);
+}
+
+void runGrab(const std::shared_ptr<ThumbShared> &shared, const QString &key, const Request &r, bool warm);
+
+// Decode pool. afterGrab: the frame grab for this request already ran (`grabbed` is its result if it was
+// for the same image) -- answer with whatever exists now, never queue another grab.
+void serveLive(const std::shared_ptr<ThumbShared> &shared, const Pending &p, const QImage &grabbed, bool afterGrab)
+{
+    const Request &r = p.req;
+    const QSize out = targetSize(p.requested, r.kind);
+    if (p.resp->m_cancelled.loadRelaxed() || g_shuttingDown.loadRelaxed()) {
+        deliver(shared, p, QImage(2, 2, QImage::Format_RGB32));
+        return;
+    }
+    const QVariantMap ti = shared->info(r.titleId, r.kind == QLatin1String("ep") ? r.season : -1, r.episode);
+    if (ti.isEmpty()) {
+        deliver(shared, p, placeholder(QString(), out));
+        return;
+    }
+    if (!grabbed.isNull()) {
+        deliver(shared, p, coverCropNoUpscale(grabbed, out));
+        return;
+    }
+    bool hit = false;
+    QImage img = fromCache(r, ti, out, &hit);
+    if (hit || afterGrab) {
+        deliver(shared, p, hit ? std::move(img) : fallbackImage(r, ti, out));
+        return;
+    }
+    // needs ffmpeg: join the grab in flight for this frame, or start one
+    const QString key = grabKey(r);
+    {
+        QMutexLocker l(&shared->mutex);
+        const auto it = shared->inFlight.find(key);
+        if (it != shared->inFlight.end()) {
+            it->append(p);
+            return;
         }
-        return placeholder(text, out);
+        shared->inFlight.insert(key, {p});
     }
-    return coverCropNoUpscale(base, out);
+    shared->grabPool->start([shared, key, r]() { runGrab(shared, key, r, false); }, 10);
 }
 
-} // namespace
-
-ThumbnailProvider::ThumbnailProvider(Library *lib)
-    : QQuickAsyncImageProvider(), m_lib(lib), m_shared(std::make_shared<Shared>())
+// Grab pool. The caller registered `key` in inFlight; the requests waiting there are answered afterwards
+// on the decode pool.
+void runGrab(const std::shared_ptr<ThumbShared> &shared, const QString &key, const Request &r, bool warm)
 {
-#ifdef __GLIBC__
-    // Decoded images are short-lived multi-MB buffers allocated on several threads. With glibc's dynamic
-    // mmap threshold they end up in per-thread arenas that never shrink; a fixed threshold keeps them
-    // mmap()ed so freeing returns the memory to the OS.
-    mallopt(M_MMAP_THRESHOLD, 256 * 1024);
-#endif
-    m_pool.setMaxThreadCount(3);
-    m_pool.setExpiryTimeout(30000);
-    if (m_lib)
-        m_lib->setThumbnailProvider(this);
-}
-
-ThumbnailProvider::~ThumbnailProvider()
-{
-    g_shuttingDown.storeRelaxed(1);
+    const QVariantMap ti = shared->info(r.titleId, r.kind == QLatin1String("ep") ? r.season : -1, r.episode);
+    bool skip = ti.isEmpty() || g_shuttingDown.loadRelaxed();
+    if (!skip) { // made (or found broken) since the request missed the cache?
+        bool hit = false;
+        fromCache(r, ti, QSize(), &hit);
+        skip = hit;
+    }
+    if (!skip && !warm) { // nobody wants it any more
+        QMutexLocker l(&shared->mutex);
+        const QList<Pending> &waiting = shared->inFlight[key];
+        skip = std::all_of(waiting.cbegin(), waiting.cend(),
+                           [](const Pending &p) { return p.resp->m_cancelled.loadRelaxed() != 0; });
+    }
+    const QImage base = skip ? QImage() : grabIntoCache(r, ti);
+    QList<Pending> waiting;
     {
-        QMutexLocker l(&m_shared->mutex);
-        m_shared->warmQueue.clear();
+        QMutexLocker l(&shared->mutex);
+        waiting = shared->inFlight.take(key);
     }
-    m_pool.clear();       // drop queued requests
-    m_pool.waitForDone(); // running ones abort their ffmpeg quickly (g_shuttingDown)
-    if (m_lib)
-        m_lib->setThumbnailProvider(nullptr);
+    for (const Pending &p : std::as_const(waiting)) {
+        const bool same = p.req.kind == r.kind && p.req.season == r.season && p.req.episode == r.episode;
+        const QImage mine = same ? base : QImage();
+        shared->decodePool->start([shared, p, mine]() { serveLive(shared, p, mine, true); }, 10);
+    }
 }
 
-void ThumbnailProvider::invalidate(const QString &titleId)
+void warmJob(const std::shared_ptr<ThumbShared> &shared, const QString &job)
 {
-    QMutexLocker l(&m_shared->mutex);
-    const QString prefix = titleId + QLatin1Char('/');
-    std::erase_if(m_shared->warmQueue, [&](const QString &job) {
-        return job.startsWith(prefix) && !job.startsWith(prefix + QStringLiteral("ep/"));
-    });
-}
-
-namespace {
-void pumpWarm(const std::shared_ptr<ThumbShared> &shared, QThreadPool *pool, const InfoFn &info);
-} // namespace
-
-void ThumbnailProvider::warmUp(const QStringList &jobIds)
-{
+    const Request r = parseId(job);
+    const QVariantMap ti = shared->info(r.titleId, r.kind == QLatin1String("ep") ? r.season : -1, r.episode);
+    bool hit = true;
+    if (!ti.isEmpty() && !g_shuttingDown.loadRelaxed())
+        fromCache(r, ti, QSize(), &hit);
+    if (hit)
+        return;
+    const QString key = grabKey(r);
     {
-        QMutexLocker l(&m_shared->mutex);
-        m_shared->warmQueue.assign(jobIds.cbegin(), jobIds.cend());
-        m_shared->warmTotal = int(jobIds.size());
-        m_shared->warmDone = 0;
-        m_shared->warmTimer.start();
+        QMutexLocker l(&shared->mutex);
+        if (shared->inFlight.contains(key))
+            return; // somebody is grabbing this frame already
+        shared->inFlight.insert(key, {});
     }
-    pumpWarm(m_shared, &m_pool, infoFn());
+    runGrab(shared, key, r, true);
 }
 
-// Library::thumbInfo is private; ThumbnailProvider is a friend, so bind it here for the workers.
-std::function<QVariantMap(const QString &, int, int)> ThumbnailProvider::infoFn() const
-{
-    Library *lib = m_lib;
-    return [lib](const QString &tid, int s, int e) { return lib ? lib->thumbInfo(tid, s, e) : QVariantMap(); };
-}
-
-namespace {
-
-void pumpWarm(const std::shared_ptr<ThumbShared> &shared, QThreadPool *pool, const InfoFn &info)
+void pumpWarm(const std::shared_ptr<ThumbShared> &shared)
 {
     QMutexLocker l(&shared->mutex);
     while (shared->live == 0 && shared->warmActive < 2 && !shared->warmQueue.empty()
@@ -657,9 +794,8 @@ void pumpWarm(const std::shared_ptr<ThumbShared> &shared, QThreadPool *pool, con
         const QString job = shared->warmQueue.front();
         shared->warmQueue.pop_front();
         ++shared->warmActive;
-        pool->start([shared, pool, info, job]() {
-            const Request req = parseId(job);
-            produce(shared.get(), req, QSize(), nullptr, info);
+        shared->grabPool->start([shared, job]() {
+            warmJob(shared, job);
             {
                 QMutexLocker l2(&shared->mutex);
                 --shared->warmActive;
@@ -674,45 +810,202 @@ void pumpWarm(const std::shared_ptr<ThumbShared> &shared, QThreadPool *pool, con
 #endif
                 }
             }
-            pumpWarm(shared, pool, info);
+            pumpWarm(shared);
         }, 0);
     }
 }
 
+// Low priority (SCHED_IDLE thread, idle I/O class): delete cache files that no current title/episode can
+// use and failure markers of files that are gone or expired. `keep` holds the valid cache file names.
+void pruneCache(const QSet<QString> &keep)
+{
+#ifdef Q_OS_LINUX
+    ::syscall(SYS_ioprio_set, 1 /* IOPRIO_WHO_PROCESS (this thread) */, 0, 3 << 13 /* IOPRIO_CLASS_IDLE */);
+#endif
+    QElapsedTimer t;
+    t.start();
+    int removed = 0;
+    const QDateTime now = QDateTime::currentDateTime();
+    const QFileInfoList files = QDir(thumbsDir()).entryInfoList(QDir::Files);
+    for (const QFileInfo &fi : files) {
+        if (g_shuttingDown.loadRelaxed())
+            return;
+        const QString name = fi.fileName();
+        if (name.startsWith(QLatin1Char('.')))
+            continue;
+        const bool stalePart = name.endsWith(QLatin1String(".part")) && fi.lastModified().secsTo(now) > 3600;
+        if ((name.endsWith(QLatin1String(".jpg")) && !keep.contains(name)) || stalePart)
+            removed += QFile::remove(fi.filePath()) ? 1 : 0;
+    }
+    const QFileInfoList markers = QDir(failedDir()).entryInfoList({QStringLiteral("*.fail")}, QDir::Files);
+    for (const QFileInfo &fi : markers) {
+        if (g_shuttingDown.loadRelaxed())
+            return;
+        bool drop = fi.lastModified().secsTo(now) >= kFailedMarkerSecs;
+        if (!drop) {
+            QFile f(fi.filePath());
+            drop = !f.open(QIODevice::ReadOnly) || !QFileInfo::exists(QString::fromUtf8(f.readAll()));
+        }
+        if (drop)
+            removed += QFile::remove(fi.filePath()) ? 1 : 0;
+    }
+    if (timing())
+        qDebug("[thumbs] cache prune: %lld files checked, %d removed in %lld ms",
+               qint64(files.size() + markers.size()), removed, qint64(t.elapsed()));
+}
+
 } // namespace
+
+ThumbnailProvider::ThumbnailProvider(Library *lib)
+    : QQuickAsyncImageProvider(), m_lib(lib), m_shared(std::make_shared<Shared>())
+{
+#ifdef __GLIBC__
+    // Decoded images are short-lived multi-MB buffers allocated on several threads. With glibc's dynamic
+    // mmap threshold they end up in per-thread arenas that never shrink; a fixed threshold keeps them
+    // mmap()ed so freeing returns the memory to the OS.
+    mallopt(M_MMAP_THRESHOLD, 256 * 1024);
+#endif
+    m_pool.setMaxThreadCount(std::clamp(QThread::idealThreadCount(), 2, 8));
+    m_pool.setExpiryTimeout(30000);
+    m_grabPool.setMaxThreadCount(3);
+    m_grabPool.setExpiryTimeout(30000);
+    m_shared->info = infoFn();
+    m_shared->decodePool = &m_pool;
+    m_shared->grabPool = &m_grabPool;
+    if (m_lib) {
+        m_lib->setThumbnailProvider(this);
+        // prune the disk cache a while after the library settled (at most once a day, see prune())
+        m_pruneTimer = new QTimer(this);
+        m_pruneTimer->setSingleShot(true);
+        m_pruneTimer->setInterval(60000);
+        QObject::connect(m_pruneTimer, &QTimer::timeout, this, [this]() { prune(); });
+        QObject::connect(m_lib, &Library::libraryChanged, m_pruneTimer, qOverload<>(&QTimer::start));
+    }
+}
+
+ThumbnailProvider::~ThumbnailProvider()
+{
+    g_shuttingDown.storeRelaxed(1);
+    {
+        QMutexLocker l(&m_shared->mutex);
+        m_shared->warmQueue.clear();
+    }
+    m_grabPool.clear(); // drop queued requests
+    m_pool.clear();
+    m_grabPool.waitForDone(); // running ones abort their ffmpeg quickly (g_shuttingDown)
+    m_pool.waitForDone();
+    if (m_pruneThread) {
+        m_pruneThread->wait();
+        delete m_pruneThread;
+    }
+    if (m_lib)
+        m_lib->setThumbnailProvider(nullptr);
+}
+
+void ThumbnailProvider::invalidate(const QString &titleId)
+{
+    QMutexLocker l(&m_shared->mutex);
+    const QString prefix = titleId + QLatin1Char('/');
+    std::erase_if(m_shared->warmQueue, [&](const QString &job) {
+        return job.startsWith(prefix) && !job.startsWith(prefix + QStringLiteral("ep/"));
+    });
+}
+
+void ThumbnailProvider::warmUp(const QStringList &jobIds)
+{
+    {
+        QMutexLocker l(&m_shared->mutex);
+        m_shared->warmQueue.assign(jobIds.cbegin(), jobIds.cend());
+        m_shared->warmTotal = int(jobIds.size());
+        m_shared->warmDone = 0;
+        m_shared->warmTimer.start();
+    }
+    pumpWarm(m_shared);
+}
+
+void ThumbnailProvider::prependWarmUp(const QStringList &jobIds)
+{
+    {
+        QMutexLocker l(&m_shared->mutex);
+        QSet<QString> fresh;
+        QStringList front;
+        for (const QString &job : jobIds) {
+            if (fresh.contains(job) || m_shared->inFlight.contains(grabKey(parseId(job))))
+                continue;
+            fresh.insert(job);
+            front << job;
+        }
+        // jobs that were queued already only move
+        const auto moved = std::erase_if(m_shared->warmQueue, [&](const QString &job) { return fresh.contains(job); });
+        m_shared->warmQueue.insert(m_shared->warmQueue.begin(), front.cbegin(), front.cend());
+        if (m_shared->warmTotal == 0) { // the previous warm-up had finished: a new (small) batch
+            m_shared->warmDone = 0;
+            m_shared->warmTimer.start();
+        }
+        m_shared->warmTotal += int(front.size() - qsizetype(moved));
+    }
+    pumpWarm(m_shared);
+}
+
+// Library::thumbInfo is private; ThumbnailProvider is a friend, so bind it here for the workers.
+std::function<QVariantMap(const QString &, int, int)> ThumbnailProvider::infoFn() const
+{
+    Library *lib = m_lib;
+    return [lib](const QString &tid, int s, int e) { return lib ? lib->thumbInfo(tid, s, e) : QVariantMap(); };
+}
+
+// Main thread, a minute after the library changed. Only runs when the library looks complete (not scanning,
+// every library folder present -- an unmounted drive must not cost its thumbnails) and the last prune is
+// more than a day old (stamp file thumbs/.pruned). Reads the library only through its public C++ API.
+void ThumbnailProvider::prune()
+{
+    if (!m_lib || m_pruneThread || g_shuttingDown.loadRelaxed())
+        return;
+    if (m_lib->scanning()) {
+        m_pruneTimer->start();
+        return;
+    }
+    const QString stamp = thumbsDir() + QStringLiteral("/.pruned");
+    const QFileInfo si(stamp);
+    if (si.exists() && si.lastModified().secsTo(QDateTime::currentDateTime()) < 24 * 3600)
+        return;
+    const QStringList folders = m_lib->folders();
+    const QStringList ids = m_lib->allTitles()->ids();
+    if (ids.isEmpty() || !std::all_of(folders.cbegin(), folders.cend(), [](const QString &dir) { return QFileInfo::exists(dir); }))
+        return;
+    QSet<QString> keep;
+    for (const QString &id : ids) {
+        const Title *t = m_lib->findTitle(id);
+        if (!t)
+            continue;
+        keep << frameCacheName(id, QStringLiteral("card"), 0, 0) << frameCacheName(id, QStringLiteral("backdrop"), 0, 0);
+        for (const MediaFile &f : t->files)
+            keep << frameCacheName(id, QStringLiteral("ep"), f.season, f.episode);
+    }
+    QFile f(stamp);
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        f.close();
+    m_pruneThread = QThread::create([keep]() { pruneCache(keep); });
+    QObject::connect(m_pruneThread, &QThread::finished, this, [this]() {
+        m_pruneThread->deleteLater();
+        m_pruneThread = nullptr;
+    });
+    m_pruneThread->start(QThread::IdlePriority);
+}
 
 QQuickImageResponse *ThumbnailProvider::requestImageResponse(const QString &id, const QSize &requestedSize)
 {
     auto *resp = new ThumbResponse;
-    const Request req = parseId(id);
-    const InfoFn info = infoFn();
+    Pending p;
+    p.resp = resp;
+    p.req = parseId(id);
+    p.requested = requestedSize;
+    p.timer.start();
     std::shared_ptr<ThumbShared> shared = m_shared;
-    QThreadPool *pool = &m_pool;
     {
         QMutexLocker l(&shared->mutex);
         ++shared->live;
     }
-    pool->start([resp, req, requestedSize, info, shared, pool]() {
-        QElapsedTimer t;
-        t.start();
-        const QSize out = targetSize(requestedSize, req.kind);
-        QImage img;
-        if (resp->m_cancelled.loadRelaxed() || g_shuttingDown.loadRelaxed())
-            img = QImage(2, 2, QImage::Format_RGB32);
-        else
-            img = produce(shared.get(), req, out, &resp->m_cancelled, info);
-        if (img.isNull())
-            img = placeholder(QString(), out);
-        if (timing())
-            qDebug("[thumbs] %s/%s req %dx%d -> %dx%d in %lld ms", qPrintable(req.titleId), qPrintable(req.kind),
-                   requestedSize.width(), requestedSize.height(), img.width(), img.height(), qint64(t.elapsed()));
-        resp->m_image = std::move(img);
-        {
-            QMutexLocker l(&shared->mutex);
-            --shared->live;
-        }
-        emit resp->finished(); // the engine deletes resp after this; don't touch it afterwards
-        pumpWarm(shared, pool, info);
-    }, 10);
+    m_pool.start([shared, p]() { serveLive(shared, p, QImage(), false); }, 10);
     return resp;
 }

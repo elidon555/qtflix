@@ -12,6 +12,7 @@
 #include <QList>
 #include <QPointer>
 #include <QStringList>
+#include <QThreadPool>
 #include <memory>
 
 class QNetworkReply;
@@ -25,9 +26,11 @@ class Library;
 //   (search/movie or search/tv with year), downloads poster (w500), backdrop (w1280), title logo
 //   (images endpoint, prefer PNG with iso_639_1 == "en" or null), and for series the episode stills + overviews
 //   per season. Everything is cached under QStandardPaths::CacheLocation/tmdb/ (JSON per title id + images),
-//   so later launches apply instantly offline without network access.
+//   so later launches apply instantly offline without network access. The cache is read and written on a
+//   background thread (no fsync; temp file + rename).
 // - Applies results through Library::setExternalMetadata / setExternalEpisodeMetadata.
-// - Rate-limited (max ~4 requests in flight), resilient to errors, never blocks the UI.
+// - Rate-limited (max 6 API requests + 8 image downloads in flight, honours 429 Retry-After), resilient to
+//   errors, never blocks the UI.
 class Tmdb : public QObject
 {
     Q_OBJECT
@@ -70,6 +73,9 @@ public:
     // Per-title state for the settings UI: {state: "matched"|"notFound"|"skipped"|"ignored"|"pending"|"new",
     //   tmdbId, series, query (parsed title), year, explicit (bool, user-assigned)}
     Q_INVOKABLE QVariantMap titleState(const QString &id) const;
+    // C++ only (thumbnail warm-up): true if this title has or is about to get TMDB artwork, so grabbing a
+    // video frame for its poster/backdrop would be wasted. Best effort: false while unknown.
+    bool expectsArtwork(const QString &id) const;
     ~Tmdb() override;
 
 signals:
@@ -78,6 +84,7 @@ signals:
     void statsChanged();
     void statusChanged();
     void searchResults(const QVariantList &results);
+    void idle(); // C++ only: a fetch batch finished (nothing queued or running any more)
 
 private:
     Library *m_lib;
@@ -94,7 +101,7 @@ private:
     using RequestPtr = std::shared_ptr<Request>;
     enum class KeyState { None, Validating, Valid, Invalid, Offline };
 
-    // network plumbing (max 4 in flight, small delay between bursts)
+    // network plumbing (separate in-flight limits for the API and the image CDN)
     void apiGet(const QString &path, const QList<QPair<QString, QString>> &query, bool interactive,
                 std::function<void(const Reply &)> cb);
     void fetchFile(const QUrl &url, std::function<void(const Reply &)> cb);
@@ -117,6 +124,7 @@ private:
     void runSearch(const JobPtr &job);
     void fetchDetails(const JobPtr &job);
     void detailsDone(const JobPtr &job);
+    void addSeason(const JobPtr &job, int season, const QJsonObject &data);
     void download(const JobPtr &job, const QString &remotePath, const QString &size, const QString &file,
                   const QString &fallbackRemotePath, std::function<void(bool)> done);
     void jobStep(const JobPtr &job);   // decrements outstanding, finishes when 0
@@ -126,6 +134,8 @@ private:
     void endJob(const JobPtr &job);
 
     // cache / overlays
+    void ioThen(std::function<bool()> work, std::function<void(bool)> then = {}); // work on m_ioPool, then main
+    void metaLoaded(const QHash<QString, QJsonObject> &all);
     QString cacheDir() const;
     QString metaFile(const QString &id) const;
     QJsonObject loadMeta(const QString &id);
@@ -144,9 +154,11 @@ private:
     KeyState m_keyState = KeyState::None;
     quint64 m_gen = 1;                       // bumped by abortAll(); stale callbacks are dropped
     quint64 m_searchSeq = 0;
-    QList<RequestPtr> m_queue;
+    QList<RequestPtr> m_queue;               // API requests (interactive ones first)
+    QList<RequestPtr> m_imgQueue;            // image downloads
+    int m_apiInFlight = 0, m_imgInFlight = 0;
     QHash<QNetworkReply *, RequestPtr> m_inFlight;
-    QTimer *m_pumpTimer = nullptr;
+    QTimer *m_apiPauseTimer = nullptr;       // running while the API asked us to back off (HTTP 429)
     QTimer *m_syncTimer = nullptr;
     QTimer *m_retryTimer = nullptr;
     bool m_applying = false;
@@ -155,10 +167,14 @@ private:
     int m_batchTotal = 0, m_batchDone = 0, m_batchNetFail = 0;
     int m_skipped = 0;
     QStringList m_ids;                       // library ids at last sync
-    QHash<QString, QJsonObject> m_cache;     // id -> meta json (as on disk)
+    QHash<QString, QJsonObject> m_cache;     // id -> meta json (as on disk; complete once m_metaLoaded)
+    bool m_metaLoaded = false;               // the on-disk cache was read (background thread at startup)
+    bool m_syncWanted = false;               // a sync was requested before that
+    mutable QHash<QString, QPair<QString, bool>> m_junk; // id -> (title + file name, isJunk) memo
     QHash<QString, QString> m_state;         // id -> state string
     QHash<QString, QJsonObject> m_overrides; // id -> {tmdbId, series} explicit user mapping
     QString m_imageBase;
     QString m_apiBase;
+    QThreadPool m_ioPool;                    // one thread: cache reads/writes, in order
     static inline Tmdb *s_instance = nullptr;
 };
