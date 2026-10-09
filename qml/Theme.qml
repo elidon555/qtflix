@@ -39,8 +39,8 @@ QtObject {
     // Screens without a NavBar (profiles, intro) use their own width.
     // ---------------------------------------------------------------------------------------------
     property real windowWidth: 1600
-    function vw(x) { return windowWidth * x / 100 }
-    function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
+    function vw(x: real): real { return windowWidth * x / 100 }
+    function clamp(v: real, lo: real, hi: real): real { return Math.max(lo, Math.min(hi, v)) }
     readonly property real gutter: Math.round(Math.max(40, vw(4)))                 // 4vw, min 40px
     readonly property real cardGap: Math.max(4, vw(0.4))                            // 2 x .2vw
     readonly property int navH: Math.round(clamp(vw(4.25), 68, 104))                // 68px at <=1600
@@ -48,7 +48,11 @@ QtObject {
     readonly property real logoH: Math.round(clamp(vw(1.6), 22, 40))                // wordmark height
     readonly property real rowHeaderFont: Math.round(Math.max(12, vw(1.4)))         // row titles 1.4vw
     // cards per page: 6 >= 1400, 5 >= 1100, 4 >= 800 (Netflix breakpoints), 3 below
-    function cardsPerPage(w) { return w >= 1400 ? 6 : (w >= 1100 ? 5 : (w >= 800 ? 4 : 3)) }
+    function cardsPerPage(w: real): int { return w >= 1400 ? 6 : (w >= 1100 ? 5 : (w >= 800 ? 4 : 3)) }
+    // Image.sourceSize for thumbnails shown `w` px wide: the width rounded up to 80 px steps (1920 max), height from
+    // the image's aspect. Layout passes through transient widths (0, negative, half laid out); quantizing keeps
+    // those from each requesting (and caching) another decode of the same picture.
+    function thumbSize(w: real): size { return Qt.size(Math.min(1920, Math.max(80, Math.ceil(w / 80) * 80)), 0) }
 
     // Netflix easing curves
     readonly property var easePage: [0.5, 0, 0.1, 1, 1, 1]                          // row paging (750 ms)
@@ -86,8 +90,8 @@ QtObject {
         } catch (e) {}
         return defaultProfiles
     }
-    function setProfiles(list) { profiles = list; profileSettings.list = JSON.stringify(list) }
-    function selectProfile(p) {
+    function setProfiles(list: var) { profiles = list; profileSettings.list = JSON.stringify(list) }
+    function selectProfile(p: var) {
         if (!p) return
         Nav.profileName = p.name; Nav.profileColor = p.color; Nav.profileAvatar = p.avatar
         profileSettings.current = p.name
@@ -102,7 +106,7 @@ QtObject {
     }
     Component.onCompleted: restoreProfile()
 
-    function relativeDate(added) {
+    function relativeDate(added: var): string {
         const d = new Date(added)
         if (!added || isNaN(d.getTime())) return ""
         const days = Math.floor((Date.now() - d.getTime()) / (24 * 3600 * 1000))
@@ -117,30 +121,24 @@ QtObject {
     }
 
     // --- formatting helpers ---
-    function duration(ms) {
+    function duration(ms: real): string {
         const m = Math.round((ms || 0) / 60000)
         if (m <= 0) return ""
         const h = Math.floor(m / 60), r = m % 60
         return h > 0 ? (r > 0 ? h + "h " + r + "m" : h + "h") : r + "m"
     }
-    function seasonsLabel(n) { return n === 1 ? "1 Season" : n + " Seasons" }
-    function episodesLabel(n) { return n === 1 ? "1 Episode" : n + " Episodes" }
+    function seasonsLabel(n: int): string { return n === 1 ? "1 Season" : n + " Seasons" }
+    function episodesLabel(n: int): string { return n === 1 ? "1 Episode" : n + " Episodes" }
     // "5 Seasons" for multi-season shows, "8 Episodes" for a single season, "2h 5m" for movies
-    function lengthLabel(t) {
-        if (!t) return ""
-        if (t.isSeries) return t.seasonCount > 1 ? seasonsLabel(t.seasonCount) : episodesLabel(t.episodeCount || 0)
-        return duration(t.durationMs)
+    function lengthLabel(isSeries: bool, seasonCount: int, episodeCount: int, durationMs: real): string {
+        if (isSeries) return seasonCount > 1 ? seasonsLabel(seasonCount) : episodesLabel(episodeCount)
+        return duration(durationMs)
     }
-    function remaining(posMs, durMs) {
+    function remaining(posMs: real, durMs: real): string {
         const left = Math.max(0, (durMs || 0) - (posMs || 0))
         const m = Math.round(left / 60000)
         if (m <= 0) return ""
         const h = Math.floor(m / 60), r = m % 60
         return (h > 0 ? h + "h " + r + "m" : r + "m") + " left"
-    }
-    function isRecent(added) {
-        if (!added) return false
-        const d = new Date(added)
-        return !isNaN(d.getTime()) && (Date.now() - d.getTime()) < 7 * 24 * 3600 * 1000
     }
 }

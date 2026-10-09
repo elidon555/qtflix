@@ -123,6 +123,14 @@ Item {
                 }
             }
             Timer { id: refocus; interval: 0; onTriggered: if (search.open) input.forceActiveFocus() }
+            Timer { id: searchDebounce; interval: 150; onTriggered: search.applyQuery() }
+            function applyQuery() {
+                searchDebounce.stop()
+                const text = input.text
+                Library.searchQuery = text
+                if (text.trim() !== "") { if (Nav.page !== "search") Nav.go("search") }
+                else if (Nav.page === "search") Nav.go(Nav.previousPage === "search" ? "home" : Nav.previousPage)
+            }
             Rectangle {
                 anchors.fill: parent
                 color: Qt.rgba(0, 0, 0, 0.75)
@@ -164,11 +172,8 @@ Item {
                     font: input.font
                     visible: input.text === ""
                 }
-                onTextChanged: {
-                    Library.searchQuery = text
-                    if (text.trim() !== "") { if (Nav.page !== "search") Nav.go("search") }
-                    else if (Nav.page === "search") Nav.go(Nav.previousPage === "search" ? "home" : Nav.previousPage)
-                }
+                // typing is debounced (one search + results relayout per pause, not per key); clearing is immediate
+                onTextChanged: { if (text === "") search.applyQuery(); else searchDebounce.restart() }
                 onActiveFocusChanged: if (!activeFocus && text === "") search.open = false
                 Keys.onEscapePressed: { search.closeBox() }
             }
@@ -335,16 +340,8 @@ Item {
         property int newCount: 0
         function refresh() {
             bellX = bell.mapToItem(root, bell.width / 2, 0).x
-            const all = Library.allTitles, list = []
-            let fresh = 0
-            for (let i = 0; all && i < all.count; ++i) {
-                const t = all.get(i)
-                if (Theme.isRecent(t.added)) ++fresh
-                list.push(t)
-            }
-            list.sort((a, b) => new Date(b.added).getTime() - new Date(a.added).getTime())
-            items = list.slice(0, 5)
-            newCount = fresh
+            items = Library.recentTitles(5)          // newest first
+            newCount = Library.recentCount()         // added within the last 7 days
         }
         Connections { target: Library; function onLibraryChanged() { notif.refresh() } }
         Component.onCompleted: refresh()
@@ -381,7 +378,7 @@ Item {
                         x: 16; anchors.verticalCenter: parent.verticalCenter
                         width: Math.round(root.fs * 8); height: Math.round(width * 9 / 16)
                         source: nr.modelData.backdropImage
-                        sourceSize: Qt.size(width * 2, height * 2)
+                        sourceSize: Theme.thumbSize(width * 2)
                         fillMode: Image.PreserveAspectCrop
                         asynchronous: true; cache: true
                         Rectangle { anchors.fill: parent; color: "#2F2F2F"; visible: parent.status !== Image.Ready; z: -1 }

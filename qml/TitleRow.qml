@@ -11,7 +11,7 @@ Item {
     property string name
     property string kind: "normal"           // "continue" | "mylist" | "top10" | "normal"
     property real pad: Theme.gutter
-    signal preview(var item, rect globalRect)
+    signal preview(string id, rect globalRect)
     signal exploreAll()
 
     readonly property int perPage: Theme.cardsPerPage(width)
@@ -33,9 +33,11 @@ Item {
 
     // The ListView spans the full row width (so peeking cards in the gutters aren't culled) with
     // left/right margins = gutter; contentX == -pad shows the first card at the gutter.
-    function maxX() { return Math.max(0, itemCount * stride - spacing - avail) }
-    function xForPage(p) { return -pad + Math.min(p * perPage * stride, maxX()) }
-    function goPage(p) {
+    function maxX(): real { return Math.max(0, itemCount * stride - spacing - avail) }
+    function xForPage(p: int): real { return -pad + Math.min(p * perPage * stride, maxX()) }
+    // jump without animation (a recycled row delegate restoring the page it had)
+    function setPage(p: int) { slide.stop(); page = Math.max(0, p); clampPage(); list.contentX = xForPage(page) }
+    function goPage(p: int) {
         p = Math.max(0, Math.min(pageCount - 1, p))
         if (p === page && !slide.running) return
         page = p
@@ -139,22 +141,29 @@ Item {
         interactive: false
         spacing: root.spacing
         clip: false
-        cacheBuffer: Math.max(0, Math.round(root.stride * 2))
+        cacheBuffer: Math.max(0, Math.round(root.avail))      // one page either side
         Component.onCompleted: contentX = root.xForPage(root.page)
         onCountChanged: relayout.restart()
         boundsBehavior: Flickable.StopAtBounds
-        reuseItems: false
+        reuseItems: true
         delegate: TitleCard {
             id: card
+            // TitleModel roles ("id" can't be a property name, so that one is read through `model`)
             required property var model
             required property int index
+            required title
+            required backdropImage
+            required hasMeta
+            required isRecent
+            required progress
+            required path
+            titleId: model.id
             width: root.cardW
-            item: model
             kind: root.kind
             visible: root.kind !== "top10" || index < 10
             previewEnabled: visible && root.inView(x, width)
-            onClicked: root.activate(card.item)
-            onPreview: (it, r) => root.preview(it, r)
+            onClicked: root.activate(card.titleId, card.path)
+            onPreview: (id, r) => root.preview(id, r)
         }
 
         NumberAnimation {
@@ -167,14 +176,14 @@ Item {
         }
     }
 
-    function inView(x, w) {
+    function inView(x: real, w: real): bool {
         const rel = x - (list.contentX + root.pad)
         return !slide.running && rel >= -2 && rel + w <= root.avail + 2
     }
-    function activate(item) {
-        if (!item) return
-        if (root.kind === "continue") Nav.play(item.path)
-        else Nav.openDetail(item.id)
+    function activate(id: string, path: string) {
+        if (id === "") return
+        if (root.kind === "continue") Nav.play(path)
+        else Nav.openDetail(id)
     }
 
     // ---------------- paddles (gutter-wide, only while the row is hovered) ----------------

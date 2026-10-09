@@ -142,8 +142,8 @@ ApplicationWindow {
     }
     Timer { id: modalScroll; interval: 1500; onTriggered: { const f = win.findScroller(modal); if (f) f.scrollTo(parseInt(win.arg("modal-scroll")), false) } }
     function findScroller(it) {
-        for (let i = 0; i < it.children.length; ++i) if (it.children[i].scrollTo) return it.children[i]
-        return null
+        const all = findAll(it, (o) => o !== it && o.scrollTo !== undefined, [])
+        return all.length ? all[0] : null
     }
     function findAll(it, pred, out) {
         if (pred(it)) out.push(it)
@@ -158,6 +158,6 @@ ApplicationWindow {
         const cards = findAll(r, (o) => o.globalRect !== undefined && o.hasItem, [])
         cards.sort((a, b) => a.mapToItem(null, 0, 0).x - b.mapToItem(null, 0, 0).x)
         const c = cards[Math.min(1, cards.length - 1)]
-        if (c) c.preview(c.item, c.globalRect())
+        if (c) c.preview(c.titleId, c.globalRect())
     }
 }

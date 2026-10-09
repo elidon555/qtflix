@@ -9,7 +9,7 @@ through Qt Multimedia's FFmpeg backend.
 ## Build & run
 
 ```
-sudo apt install cmake ninja-build qt6-base-dev qt6-declarative-dev qt6-multimedia-dev qt6-svg-dev \
+sudo apt install cmake ninja-build qt6-base-dev qt6-declarative-dev qt6-multimedia-dev qt6-svg-dev qt6-shadertools-dev \
   qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-window \
   qml6-module-qtquick-templates qml6-module-qtquick-effects qml6-module-qtquick-shapes qml6-module-qtquick-dialogs \
   qml6-module-qtqml-workerscript qml6-module-qtmultimedia qml6-module-qtcore qml6-module-qt5compat-graphicaleffects \

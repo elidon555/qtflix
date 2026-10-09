@@ -16,13 +16,13 @@ Item {
     anchors.fill: parent
     z: 50
 
-    property var item: null                  // snapshot map (Library.title)
+    readonly property TitleInfo item: TitleInfo {}   // the shown title (Library.title snapshot)
     property rect src: Qt.rect(0, 0, 0, 0)   // card rect in root coords
     property real p: 0                       // 0 = card size, 1 = fully expanded
     property bool shown: false
     property bool muted: Theme.previewMuted
     property real pad: Theme.gutter
-    readonly property bool hasItem: !!item && !!item.id
+    readonly property bool hasItem: item.valid
     readonly property bool isOpen: shown && !closeAnim.running
     readonly property alias boxItem: box
 
@@ -34,19 +34,20 @@ Item {
     readonly property real finalY: Math.max(Theme.navH * 0.4, Math.min(height - boxH - 12, src.y + src.height / 2 - imgH / 2 - imgH * 0.08))
     readonly property real startY: src.y + src.height / 2 - (src.width * 9 / 16) / 2
 
-    function open(it, globalRect) {
-        if (!it || !it.id) return
+    function open(id: string, globalRect: rect) {
+        if (id === "") return
         const pt = root.mapFromItem(null, globalRect.x, globalRect.y)
         const r = Qt.rect(pt.x, pt.y, globalRect.width, globalRect.height)
-        if (shown && item && item.id === it.id && Math.abs(r.x - src.x) < 2 && Math.abs(r.y - src.y) < 2) {
+        if (shown && item.titleId === id && Math.abs(r.x - src.x) < 2 && Math.abs(r.y - src.y) < 2) {
             graceTimer.stop()
             if (closeAnim.running) { closeAnim.stop(); openAnim.restart() }
             return
         }
+        const m = Library.title(id)
+        if (!m || !m.id) return
         stopMedia()
         closeAnim.stop()
-        const m = Library.title(it.id)
-        item = (m && m.id) ? m : copyItem(it)
+        item.assign(m)
         src = r
         p = 0
         shown = true
@@ -54,7 +55,7 @@ Item {
         openAnim.restart()
         videoTimer.restart()
     }
-    function close(immediate) {
+    function close(immediate: bool) {
         videoTimer.stop()
         graceTimer.stop()
         if (!shown) return
@@ -66,18 +67,10 @@ Item {
             closeAnim.restart()
         }
     }
-    function copyItem(it) {
-        const keys = ["id", "title", "year", "path", "sourceUrl", "isSeries", "seasonCount", "episodeCount", "durationMs",
-                      "quality", "cardImage", "backdropImage", "positionMs", "progress", "inMyList", "rating", "genres",
-                      "match", "description", "logoImage", "hasMeta"]
-        const o = {}
-        for (const k of keys) o[k] = it[k]
-        return o
-    }
     function refresh() {
         if (!hasItem) return
-        const m = Library.title(item.id)
-        if (m && m.id) item = m
+        const m = Library.title(item.titleId)
+        if (m && m.id) item.assign(m)
     }
     function stopMedia() {
         videoTimer.stop()
@@ -93,7 +86,7 @@ Item {
     }
     Connections {
         target: Library
-        function onMyListChanged(id) { if (root.hasItem && id === root.item.id) root.refresh() }
+        function onMyListChanged(id: string) { if (root.hasItem && id === root.item.titleId) root.refresh() }
         function onLibraryChanged() { root.close(true) }
     }
     onVisibleChanged: if (!visible) close(true)
@@ -115,8 +108,7 @@ Item {
     Timer {
         id: videoTimer
         interval: 1000
-        onTriggered: if (root.shown && root.hasItem && Theme.autoplayPreviews && root.item.sourceUrl
-                         && root.item.sourceUrl.toString() !== "") { root.seekTarget = 0; root.videoWanted = true }
+        onTriggered: if (root.shown && root.hasItem && Theme.autoplayPreviews && root.item.hasSource) { root.seekTarget = 0; root.videoWanted = true }
     }
 
     // ---------------- the box ----------------
@@ -143,7 +135,7 @@ Item {
             anchors.fill: parent
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
-            onClicked: if (root.hasItem) Nav.openDetail(root.item.id)
+            onClicked: if (root.hasItem) Nav.openDetail(root.item.titleId)
         }
 
         // box-shadow: 0 3px 10px rgba(0,0,0,.75)
@@ -158,15 +150,19 @@ Item {
 
         Rectangle { anchors.fill: parent; radius: 6; color: Theme.bgElevated }
 
-        // ---- media (rounded top corners via mask) ----
+        // ---- media (rounded top corners) ----
+        // The still is drawn by RoundedImages (no offscreen pass): first the card's own decode (already in the
+        // pixmap cache, so the preview never opens grey), then the 1.5x decode the card prefetched while hovered.
+        // Only while the video is loaded does the media go through a mask layer (VideoOutput can't be cut there).
         Item {
             id: media
             width: parent.width
             height: root.imgH
+            readonly property bool masked: videoLoader.active
             Item {
                 id: mediaContent
                 anchors.fill: parent
-                layer.enabled: true
+                layer.enabled: media.masked
                 layer.smooth: true
                 layer.effect: MultiEffect {
                     maskEnabled: true
@@ -174,14 +170,18 @@ Item {
                     maskThresholdMin: 0.5
                     maskSpreadAtMin: 1.0
                 }
-                Rectangle { anchors.fill: parent; color: "#2F2F2F" }
-                Image {
+                RoundedImage {
                     anchors.fill: parent
-                    source: root.hasItem ? root.item.backdropImage : ""
-                    fillMode: Image.PreserveAspectCrop
-                    asynchronous: true
-                    cache: true
-                    sourceSize: Qt.size(root.boxW, root.imgH)
+                    topLeftRadius: 6; topRightRadius: 6; bottomLeftRadius: 0; bottomRightRadius: 0
+                    source: root.item.backdropImage
+                    requestWidth: root.src.width
+                    fadeDuration: 0
+                }
+                RoundedImage {
+                    anchors.fill: parent
+                    topLeftRadius: 6; topRightRadius: 6; bottomLeftRadius: 0; bottomRightRadius: 0
+                    bg: "transparent"
+                    source: root.item.backdropImage
                 }
                 Loader {
                     id: videoLoader
@@ -190,13 +190,13 @@ Item {
                     sourceComponent: Item {
                         MediaPlayer {
                             id: player
-                            source: root.item ? root.item.sourceUrl : ""
+                            source: root.item.sourceUrl
                             videoOutput: vout
                             audioOutput: AudioOutput { muted: root.muted; volume: 0.7 }
                             onMediaStatusChanged: {
                                 if ((mediaStatus === MediaPlayer.LoadedMedia || mediaStatus === MediaPlayer.BufferedMedia)
                                         && root.seekTarget === 0 && duration > 0) {
-                                    const start = root.item && root.item.positionMs > 0 && root.item.progress < 0.95 ? root.item.positionMs : duration * 0.2
+                                    const start = root.item.positionMs > 0 && root.item.progress < 0.95 ? root.item.positionMs : duration * 0.2
                                     root.seekTarget = Math.max(1, Math.round(start))
                                     position = root.seekTarget
                                     play()
@@ -229,12 +229,12 @@ Item {
                 id: mediaMask
                 anchors.fill: parent
                 visible: false
-                layer.enabled: true
+                layer.enabled: media.masked
                 clip: true
                 Rectangle { width: parent.width; height: parent.height + 12; radius: 6 }
             }
             Image {
-                visible: !!(root.item && root.item.hasMeta)
+                visible: root.item.hasMeta
                 x: 12; y: 12
                 height: Math.round(root.boxW * 0.055); width: height
                 source: "qrc:/assets/mark.svg"
@@ -243,7 +243,7 @@ Item {
             // title logo when metadata provides one, else the title text
             Image {
                 id: miniLogo
-                readonly property bool has: root.hasItem && !!root.item.logoImage && root.item.logoImage.toString() !== ""
+                readonly property bool has: root.hasItem && root.item.hasLogo
                 readonly property bool use: has && status === Image.Ready   // falls back to the title text otherwise
                 visible: use
                 anchors.left: parent.left; anchors.leftMargin: 16
@@ -317,7 +317,7 @@ Item {
                         objectName: "previewMyList"
                         size: info.btn; iconName: root.hasItem && root.item.inMyList ? "check" : "plus"; iconScale: 0.5
                         tooltip: root.hasItem && root.item.inMyList ? "Remove from My List" : "Add to My List"
-                        onClicked: if (root.hasItem) { Library.toggleMyList(root.item.id); root.refresh() }
+                        onClicked: if (root.hasItem) { Library.toggleMyList(root.item.titleId); root.refresh() }
                     }
                     CircleButton {
                         id: likeBtn
@@ -333,7 +333,7 @@ Item {
                     anchors.right: parent.right
                     size: info.btn; iconName: "chevronDown"; iconScale: 0.5
                     tooltip: root.hasItem && root.item.isSeries ? "Episodes & info" : "More info"
-                    onClicked: if (root.hasItem) Nav.openDetail(root.item.id)
+                    onClicked: if (root.hasItem) Nav.openDetail(root.item.titleId)
                 }
             }
 
@@ -364,24 +364,24 @@ Item {
                 }
                 Rectangle {
                     anchors.verticalCenter: parent.verticalCenter
-                    visible: root.hasItem && !!root.item.rating
+                    visible: root.hasItem && root.item.rating !== ""
                     width: rText.implicitWidth + 10; height: rText.implicitHeight + 2
                     color: "transparent"; border.width: 1; border.color: Qt.rgba(1, 1, 1, 0.4)
-                    Text { id: rText; anchors.centerIn: parent; text: root.hasItem ? (root.item.rating || "") : ""; color: "white"; font.family: Theme.font; font.pixelSize: info.fs - 2 }
+                    Text { id: rText; anchors.centerIn: parent; text: root.item.rating; color: "white"; font.family: Theme.font; font.pixelSize: info.fs - 2 }
                 }
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
-                    text: Theme.lengthLabel(root.item)
+                    text: Theme.lengthLabel(root.item.isSeries, root.item.seasonCount, root.item.episodeCount, root.item.durationMs)
                     color: "white"
                     font.family: Theme.font; font.pixelSize: info.fs
                 }
                 Rectangle {
                     anchors.verticalCenter: parent.verticalCenter
-                    visible: root.hasItem && !!root.item.quality
+                    visible: root.hasItem && root.item.quality !== ""
                     width: qText.implicitWidth + 10; height: qText.implicitHeight + 1
                     radius: 3
                     color: "transparent"; border.width: 1; border.color: Qt.rgba(1, 1, 1, 0.4)
-                    Text { id: qText; anchors.centerIn: parent; text: root.hasItem ? (root.item.quality || "") : ""; color: "white"; font.family: Theme.font; font.pixelSize: info.fs - 4; font.weight: Font.DemiBold }
+                    Text { id: qText; anchors.centerIn: parent; text: root.item.quality; color: "white"; font.family: Theme.font; font.pixelSize: info.fs - 4; font.weight: Font.DemiBold }
                 }
             }
 
@@ -392,7 +392,7 @@ Item {
                 spacing: 0
                 clip: true
                 Repeater {
-                    model: root.hasItem && root.item.genres ? root.item.genres : []
+                    model: root.item.genres
                     delegate: Row {
                         id: gr
                         required property string modelData

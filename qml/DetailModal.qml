@@ -17,8 +17,8 @@ Item {
     focus: visible
 
     readonly property string titleId: Nav.detailId
-    property var t: ({})
-    readonly property bool hasTitle: !!t && !!t.id
+    readonly property TitleInfo t: TitleInfo {}      // the shown title (Library.title snapshot)
+    readonly property bool hasTitle: t.valid
     property var seasonList: []
     property int season: 0
     property var episodes: []
@@ -32,20 +32,19 @@ Item {
     readonly property real boxW: Math.min(Math.round(width * 0.9), Math.max(850, Math.round(width * 0.53)))
     readonly property real mediaH: Math.round(boxW * 9 / 16)
     readonly property real s: boxW / 850      // scale factor for type/padding
-    readonly property bool hasLogo: hasTitle && !!t.logoImage && t.logoImage.toString() !== "" && modalLogo.status !== Image.Error
-    function seasonName(n) { return n === 0 ? "Specials" : "Season " + n }
+    readonly property bool hasLogo: hasTitle && t.hasLogo && modalLogo.status !== Image.Error
+    function seasonName(n: int): string { return n === 0 ? "Specials" : "Season " + n }
 
     function load() {
         if (titleId === "") return
-        const m = Library.title(titleId)
-        t = m || ({})
+        t.assign(Library.title(titleId))
         if (!hasTitle) return
         fileInfo = Library.fileInfo(t.path) || ({})
         if (t.isSeries) {
-            seasonList = Library.seasons(t.id) || []
+            seasonList = Library.seasons(t.titleId) || []
             const want = fileInfo && fileInfo.season ? fileInfo.season : (seasonList.length ? seasonList[0] : 1)
             season = want
-            episodes = Library.episodes(t.id, season) || []
+            loadEpisodes()
         } else {
             seasonList = []; episodes = []
         }
@@ -54,13 +53,18 @@ Item {
         const all = Library.allTitles
         for (let i = 0; all && i < all.count && out.length < 9; ++i) {
             const o = all.get(i)
-            if (!o || o.id === t.id) continue
+            if (!o || o.id === t.titleId) continue
             if (o.isSeries === t.isSeries) out.push(o); else others.push(o)
         }
         for (let j = 0; out.length < 9 && j < others.length; ++j) out.push(others[j])
         similar = out
     }
-    function refreshTitle() { if (hasTitle) { const m = Library.title(t.id); if (m && m.id) t = m } }
+    function refreshTitle() { if (hasTitle) { const m = Library.title(t.titleId); if (m && m.id) t.assign(m) } }
+    // the shown season's episodes; also asks the backend to generate that season's episode stills first
+    function loadEpisodes() {
+        episodes = Library.episodes(t.titleId, season) || []
+        Library.warmSeason(t.titleId, season)
+    }
     function close() {
         if (closing) return
         closing = true
@@ -80,12 +84,17 @@ Item {
         root.forceActiveFocus()
     }
     Component.onCompleted: if (titleId !== "") { load(); openAnim.restart(); videoTimer.restart(); root.forceActiveFocus() }
-    onSeasonChanged: if (hasTitle && t.isSeries) episodes = Library.episodes(t.id, season) || []
+    onSeasonChanged: if (hasTitle && t.isSeries) loadEpisodes()
 
     Connections {
         target: Library
-        function onMyListChanged(id) { if (root.hasTitle && id === root.t.id) root.refreshTitle() }
-        function onProgressChanged(path) { if (root.hasTitle) { root.refreshTitle(); if (root.t.isSeries) root.episodes = Library.episodes(root.t.id, root.season) || [] } }
+        function onMyListChanged(id: string) { if (root.hasTitle && id === root.t.titleId) root.refreshTitle() }
+        // only this title's files matter (the player saves progress every few seconds)
+        function onProgressChanged(path: string) {
+            if (!root.hasTitle || Library.titleIdForPath(path) !== root.t.titleId) return
+            root.refreshTitle()
+            if (root.t.isSeries) root.episodes = Library.episodes(root.t.titleId, root.season) || []
+        }
         function onLibraryChanged() { if (root.titleId !== "") root.load() }
     }
 
@@ -106,7 +115,7 @@ Item {
     Timer {
         id: videoTimer
         interval: 1000
-        onTriggered: if (root.hasTitle && Theme.autoplayPreviews && root.t.sourceUrl && root.t.sourceUrl.toString() !== "") { root.seekTarget = 0; root.videoWanted = true }
+        onTriggered: if (root.hasTitle && Theme.autoplayPreviews && root.t.hasSource) { root.seekTarget = 0; root.videoWanted = true }
     }
 
     // ---- dim overlay ----
@@ -160,26 +169,27 @@ Item {
                     width: parent.width
                     height: root.mediaH
 
+                    // the still is a RoundedImage (no offscreen pass); only while the video is loaded does the
+                    // header go through a mask layer for its rounded top corners
+                    readonly property bool masked: videoLoader.active
                     Item {
                         id: mediaContent
                         anchors.fill: parent
-                        layer.enabled: true
+                        layer.enabled: media.masked
                         layer.effect: MultiEffect {
                             maskEnabled: true
                             maskSource: mediaMask
                             maskThresholdMin: 0.5
                             maskSpreadAtMin: 1.0
                         }
-                        Rectangle { anchors.fill: parent; color: "#2F2F2F" }
-                        Image {
+                        RoundedImage {
                             anchors.fill: parent
+                            topLeftRadius: 6; topRightRadius: 6; bottomLeftRadius: 0; bottomRightRadius: 0
+                            fadeDuration: 0
                             source: root.hasTitle ? root.t.backdropImage : ""
-                            fillMode: Image.PreserveAspectCrop
-                            asynchronous: true
-                            cache: true
-                            sourceSize: Qt.size(root.boxW, root.mediaH)
                         }
                         Loader {
+                            id: videoLoader
                             anchors.fill: parent
                             active: root.videoWanted && root.hasTitle && !root.closing
                             sourceComponent: Item {
@@ -233,7 +243,7 @@ Item {
                         id: mediaMask
                         anchors.fill: parent
                         visible: false
-                        layer.enabled: true
+                        layer.enabled: media.masked
                         clip: true
                         Rectangle { width: parent.width; height: parent.height + 10; radius: 6 }
                     }
@@ -278,7 +288,7 @@ Item {
                             Image {
                                 id: modalLogo
                                 visible: root.hasLogo
-                                source: root.hasTitle && root.t.logoImage ? root.t.logoImage : ""
+                                source: root.hasTitle && root.t.hasLogo ? root.t.logoImage : ""
                                 asynchronous: true; cache: true
                                 fillMode: Image.PreserveAspectFit
                                 mipmap: true
@@ -318,7 +328,7 @@ Item {
                                 size: Math.round(42 * root.s)
                                 iconName: root.hasTitle && root.t.inMyList ? "check" : "plus"
                                 tooltip: root.hasTitle && root.t.inMyList ? "Remove from My List" : "Add to My List"
-                                onClicked: if (root.hasTitle) { Library.toggleMyList(root.t.id); root.refreshTitle() }
+                                onClicked: if (root.hasTitle) { Library.toggleMyList(root.t.titleId); root.refreshTitle() }
                             }
                             CircleButton {
                                 id: like
@@ -370,7 +380,7 @@ Item {
                                     color: "#BCBCBC"; font.family: Theme.font; font.pixelSize: Math.round(16 * root.s)
                                 }
                                 Text {
-                                    text: Theme.lengthLabel(root.t)
+                                    text: Theme.lengthLabel(root.t.isSeries, root.t.seasonCount, root.t.episodeCount, root.t.durationMs)
                                     color: "#BCBCBC"; font.family: Theme.font; font.pixelSize: Math.round(16 * root.s)
                                 }
                                 Rectangle {
@@ -437,10 +447,10 @@ Item {
                             width: (detailsRow.width - detailsRow.spacing) / 3
                             spacing: 14
                             topPadding: 2
-                            TagLine { label: "Genres:"; value: root.hasTitle && root.t.genres ? root.t.genres.join(", ") : "" }
+                            TagLine { label: "Genres:"; value: root.t.genreText }
                             TagLine {
                                 label: root.hasTitle && root.t.isSeries ? "This show is:" : "This movie is:"
-                                value: root.hasTitle && root.t.genres ? root.t.genres.slice(0, 2).join(", ") : ""
+                                value: root.t.mainGenres
                             }
                             TagLine { label: "File:"; value: root.hasTitle ? (root.t.category || "") : "" }
                         }
@@ -500,7 +510,7 @@ Item {
                                     spacing: 6
                                     leftPadding: 4
                                     Text { anchors.verticalCenter: parent.verticalCenter; text: root.seasonName(sd.modelData); color: "white"; font.family: Theme.font; font.pixelSize: Math.round(16 * root.s); font.weight: sd.modelData === root.season ? Font.Bold : Font.Normal }
-                                    Text { anchors.verticalCenter: parent.verticalCenter; text: "(" + Library.episodes(root.t.id, sd.modelData).length + " Episodes)"; color: "#B3B3B3"; font.family: Theme.font; font.pixelSize: Math.round(13 * root.s) }
+                                    Text { anchors.verticalCenter: parent.verticalCenter; text: "(" + Library.episodeCount(root.t.titleId, sd.modelData) + " Episodes)"; color: "#B3B3B3"; font.family: Theme.font; font.pixelSize: Math.round(13 * root.s) }
                                 }
                             }
                             popup: Popup {
@@ -567,29 +577,21 @@ Item {
                                 x: epNum.width + 8
                                 anchors.verticalCenter: parent.verticalCenter
                                 width: Math.round(Math.max(130, epSection.width * 0.18)); height: Math.round(width * 9 / 16)
-                                Item {
-                                    id: thumbContent
+                                RoundedImage {
                                     anchors.fill: parent
-                                    layer.enabled: true
-                                    layer.effect: MultiEffect { maskEnabled: true; maskSource: thumbMask; maskThresholdMin: 0.5; maskSpreadAtMin: 1.0 }
-                                    Rectangle { anchors.fill: parent; color: "#2F2F2F" }
-                                    Image {
-                                        anchors.fill: parent
-                                        source: ep.modelData.still || ep.modelData.thumb || ""
-                                        fillMode: Image.PreserveAspectCrop
-                                        asynchronous: true
-                                        cache: true
-                                        sourceSize: Qt.size(epThumb.width, epThumb.height)
-                                    }
-                                    Item {
-                                        visible: (ep.modelData.progress || 0) > 0.005
-                                        anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom
-                                        height: 4
-                                        Rectangle { anchors.fill: parent; color: "#4D4D4D" }
-                                        Rectangle { height: parent.height; width: parent.width * Math.min(1, ep.modelData.progress || 0); color: Theme.red }
+                                    radius: 4
+                                    source: ep.modelData.still || ep.modelData.thumb || ""
+                                }
+                                Item {
+                                    visible: (ep.modelData.progress || 0) > 0.005
+                                    anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom
+                                    height: 4
+                                    Rectangle { anchors.fill: parent; color: "#4D4D4D"; bottomLeftRadius: 4; bottomRightRadius: 4; antialiasing: true }
+                                    Rectangle {
+                                        height: parent.height; width: parent.width * Math.min(1, ep.modelData.progress || 0); color: Theme.red
+                                        bottomLeftRadius: 4; bottomRightRadius: width >= parent.width - 4 ? 4 : 0; antialiasing: true
                                     }
                                 }
-                                Rectangle { id: thumbMask; anchors.fill: parent; radius: 4; visible: false; layer.enabled: true }
                                 Rectangle {
                                     anchors.centerIn: parent
                                     width: Math.round(40 * root.s); height: width; radius: width / 2
@@ -677,16 +679,11 @@ Item {
                                 Item {
                                     id: simImg
                                     width: parent.width; height: Math.round(width * 9 / 16)
-                                    layer.enabled: true
-                                    layer.effect: MultiEffect { maskEnabled: true; maskSource: simMask; maskThresholdMin: 0.5; maskSpreadAtMin: 1.0 }
-                                    Rectangle { anchors.fill: parent; color: "#3A3A3A" }
-                                    Image {
+                                    RoundedImage {
                                         anchors.fill: parent
+                                        topLeftRadius: 4; topRightRadius: 4; bottomLeftRadius: 0; bottomRightRadius: 0
+                                        bg: "#3A3A3A"
                                         source: sim.modelData.backdropImage
-                                        fillMode: Image.PreserveAspectCrop
-                                        asynchronous: true
-                                        cache: true
-                                        sourceSize: Qt.size(simImg.width, simImg.height)
                                     }
                                     Rectangle {
                                         anchors.fill: parent
@@ -697,7 +694,7 @@ Item {
                                     }
                                     Text {
                                         anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 8
-                                        text: Theme.lengthLabel(sim.modelData)
+                                        text: Theme.lengthLabel(sim.modelData.isSeries, sim.modelData.seasonCount, sim.modelData.episodeCount, sim.modelData.durationMs)
                                         color: "white"; font.family: Theme.font; font.pixelSize: Math.round(14 * root.s); font.weight: Font.Medium
                                         style: Text.Raised; styleColor: Qt.rgba(0, 0, 0, 0.5)
                                     }
@@ -717,9 +714,6 @@ Item {
                                         Behavior on opacity { NumberAnimation { duration: 150 } }
                                         Icon { anchors.centerIn: parent; anchors.horizontalCenterOffset: 1; name: "play"; size: Math.round(20 * root.s); color: "white" }
                                     }
-                                }
-                                Rectangle {
-                                    id: simMask; width: simImg.width; height: simImg.height + 8; radius: 4; visible: false; layer.enabled: true
                                 }
                                 MouseArea { id: sma; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: Nav.openDetail(sim.modelData.id) }
                                 Column {
@@ -785,11 +779,11 @@ Item {
                         width: parent.width
                         wrapMode: Text.WordWrap
                     }
-                    TagLine { width: parent.width; label: "Genres:"; value: root.hasTitle && root.t.genres ? root.t.genres.join(", ") : "" }
+                    TagLine { width: parent.width; label: "Genres:"; value: root.t.genreText }
                     TagLine {
                         width: parent.width
                         label: root.hasTitle && root.t.isSeries ? "This show is:" : "This movie is:"
-                        value: root.hasTitle && root.t.genres ? root.t.genres.slice(0, 2).join(", ") : ""
+                        value: root.t.mainGenres
                     }
                     TagLine { width: parent.width; label: "Location:"; value: root.hasTitle ? (root.t.category || "") : "" }
                     Row {
@@ -808,8 +802,8 @@ Item {
         }
     }
 
-    function esc(s) { return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;") }
-    function advisory(r) {
+    function esc(s: string): string { return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;") }
+    function advisory(r: string): string {
         switch (r) {
         case "TV-MA": return "violence, language"
         case "R": return "violence, language, substances"
@@ -819,7 +813,7 @@ Item {
         default: return ""
         }
     }
-    function ageText(r) {
+    function ageText(r: string): string {
         switch (r) {
         case "TV-MA": case "R": return "Recommended for ages 17 and up"
         case "TV-14": return "Recommended for ages 14 and up"

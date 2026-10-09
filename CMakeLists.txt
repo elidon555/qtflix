@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Quick Qml QuickControls2 Multimedia Svg Concurrent Network)
+find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Quick Qml QuickControls2 Multimedia Svg Concurrent Network ShaderTools)
 qt_standard_project_setup(REQUIRES 6.5)
 qt_policy(SET QTP0001 NEW)
 
@@ -37,6 +37,12 @@ qt_add_qml_module(qtflix
     RESOURCE_PREFIX /
     NO_RESOURCE_TARGET_PATH
     NO_IMPORT_SCAN
+)
+
+# Shaders (compiled to .qsb at build time; ShaderEffect loads qrc:/shaders/<name>.qsb)
+qt_add_shaders(qtflix "qtflix_shaders"
+    PREFIX "/"
+    FILES shaders/roundedimage.frag
 )
 
 target_include_directories(qtflix PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

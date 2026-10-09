@@ -6,7 +6,7 @@ import QtFlix
 // Real-pointer verification for the browse UI. Mounts the same content as Main/DevBrowse and drives it with
 // QtTest's synthetic mouse/key events (TestCase with `when: false` is only used as an event injector).
 // Prints PASS/FAIL lines and saves screenshots of key moments to $QTFLIX_SHOTS (default /tmp).
-//   QTFLIX_ROOT=DevPointer ./build-browse/qtflix [--size=WxH]
+//   QTFLIX_ROOT=DevPointer ./build-browse/qtflix [--size=WxH] [--query=<lowercase text to type, default min>]
 ApplicationWindow {
     id: win
     width: 1600; height: 900
@@ -99,6 +99,7 @@ ApplicationWindow {
         const e = Qt.application.arguments.filter(a => a.indexOf("--shots=") === 0)
         return e.length ? e[0].substring(8) : "/tmp"
     }
+    readonly property string query: arg("query") || "min"
     property int passes: 0
     property int fails: 0
     function check(name, cond, extra) {
@@ -141,7 +142,7 @@ ApplicationWindow {
     function ensureVisible(r) {
         const f = find(page(), o => o.scrollTo !== undefined)
         const y = r.mapToItem(win.contentItem, 0, 0).y
-        if (y + r.height > win.height - 20) f.scrollTo(f.contentY + (y + r.height - win.height + 60), false)
+        if (y + r.height > win.height - 20) f.scrollTo(f.scrollY + (y + r.height - win.height + 60), false)
     }
     function bigRow() { const rs = rows().filter(r => r.pageCount > 1); return rs.length ? rs[0] : rows()[0] }
     function preview() { return page() ? page().hoverPreview : null }
@@ -243,16 +244,16 @@ ApplicationWindow {
         () => { check("New & Popular page", Nav.page === "new", Nav.page)
                 const rs = rows(); const t = rs.filter(r => r.kind === "top10")
                 check("top10 rows render as landscape rows", t.length > 0 && Math.abs(t[0].cardH - Math.round(t[0].cardW * 9 / 16)) < 1)
-                if (t.length) { const f = find(page(), o => o.scrollTo !== undefined); f.scrollTo(t[0].mapToItem(f.contentItem, 0, 0).y - Theme.navH - 20, false) }
+                if (t.length) { const f = find(page(), o => o.scrollTo !== undefined); f.scrollTo(t[0].mapToItem(f.contentItem, 0, 0).y - f.originY - Theme.navH - 20, false) }
                 return 700 },
         () => { shot("13_top10"); const t = rows().filter(r => r.kind === "top10"); const cs = cardsOf(t[0]); moveTo(cs[Math.min(2, cs.length - 1)]); return 900 },
         () => { check("hover preview works on a top10 row", preview().isOpen); shot("14_top10_preview"); moveAbs(win.width / 2, 5); return 500 },
 
         // ---- search ----
         () => { const s = byName(nav, "searchBox"); clickOn(s, 12, s.height / 2); return 400 },
-        () => { tc.keyClick(Qt.Key_M); tc.keyClick(Qt.Key_I); tc.keyClick(Qt.Key_N); return 1200 },
+        () => { for (const ch of win.query) tc.keyClick(ch); return 1200 },
         () => { check("typing in search opens the search page", Nav.page === "search", Nav.page)
-                check("all typed keys reach the search box", Library.searchQuery === "min", Library.searchQuery)
+                check("all typed keys reach the search box", Library.searchQuery === win.query, Library.searchQuery)
                 check("search has results", Library.searchResults.count > 0, Library.searchResults.count)
                 shot("15_search"); return 50 },
         () => { const g = byName(page(), "searchGrid"); const cs = findAll(g, o => o.globalRect !== undefined && o.hasItem, []); moveTo(cs[0], 20, 20); return 120 },
