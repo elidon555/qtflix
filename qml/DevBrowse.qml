@@ -15,6 +15,7 @@ import QtFlix
 //   --next-page=<row>   page the given home row forward once
 //   --add-mylist        put the first 8 titles in My List
 //   --open-detail-hero  open the detail modal on the hero title
+//   --count=<ms>        after <ms>, log "[count] items=N cards=M" (visual items in the scene, TitleCards)
 ApplicationWindow {
     id: win
     width: 1600; height: 900
@@ -128,6 +129,15 @@ ApplicationWindow {
                 if (rows.length) rows[Math.min(parseInt(win.arg("next-page")) || 0, rows.length - 1)].goPage(1)
             }
             if (win.arg("preview") !== "" && pageLoader.item) win.simulatePreview(parseInt(win.arg("preview")) || 0)
+        }
+    }
+    Timer {
+        interval: parseInt(win.arg("count")) || 1
+        running: win.arg("count") !== ""
+        onTriggered: {
+            const all = win.findAll(win.contentItem, () => true, [])
+            const cards = all.filter((o) => o.globalRect !== undefined && o.hasItem !== undefined)
+            console.log("[count] items=" + all.length + " cards=" + cards.length)
         }
     }
     Timer { id: modalScroll; interval: 1500; onTriggered: { const f = win.findScroller(modal); if (f) f.scrollTo(parseInt(win.arg("modal-scroll")), false) } }
