@@ -2,16 +2,17 @@
 #include "library.h"
 
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QLoggingCategory>
+#include <QMetaObject>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QRegularExpression>
-#include <QSaveFile>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QTimer>
@@ -19,15 +20,18 @@
 #include <QSet>
 #include <algorithm>
 #include <climits>
+#include <cstdio>
 #include <tuple>
+#include <utility>
 
 Q_LOGGING_CATEGORY(lcTmdb, "qtflix.tmdb", QtWarningMsg)
 
 namespace {
-constexpr int kMaxInFlight = 4;          // requests in flight
-constexpr int kBurstDelayMs = 120;       // pause before refilling free slots
+constexpr int kMaxApiInFlight = 6;       // API requests in flight (TMDB allows ~20 connections, ~50 req/s)
+constexpr int kMaxImageInFlight = 8;     // image CDN downloads in flight
+constexpr int kMaxAppend = 20;           // append_to_response entries TMDB accepts per request
 constexpr int kTimeoutMs = 15000;
-constexpr int kMaxJobs = 3;              // titles processed concurrently
+constexpr int kMaxJobs = 8;              // titles processed concurrently
 constexpr int kMetaVersion = 1;
 constexpr qint64 kNotFoundRetrySecs = 7 * 24 * 3600;
 constexpr int kOfflineRetryMs = 60 * 1000;
@@ -36,9 +40,43 @@ QString yearOf(const QString &date) { return date.size() >= 4 ? date.left(4) : Q
 
 QString cleanQuery(QString s)
 {
-    s.replace(QRegularExpression(QStringLiteral("[._]+")), QStringLiteral(" "));
-    s.replace(QRegularExpression(QStringLiteral("[\\[\\](){}]")), QStringLiteral(" "));
+    static const QRegularExpression separators(QStringLiteral("[._]+"));
+    static const QRegularExpression brackets(QStringLiteral("[\\[\\](){}]"));
+    s.replace(separators, QStringLiteral(" "));
+    s.replace(brackets, QStringLiteral(" "));
     return s.simplified();
+}
+
+// Any thread. Temp file + rename: readers never see a partial file, and unlike QSaveFile there is no fsync
+// (a cache can be rebuilt; syncing each image stalls on busy disks).
+bool writeFileAtomic(const QString &path, const QByteArray &data)
+{
+    const QString tmp = path + QStringLiteral(".part");
+    QFile f(tmp);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        QDir().mkpath(QFileInfo(path).absolutePath());
+        if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+    }
+    const bool ok = f.write(data) == data.size();
+    f.close();
+    // rename(2) replaces the target atomically (QFile::rename refuses to overwrite)
+    if (!ok || std::rename(QFile::encodeName(tmp).constData(), QFile::encodeName(path).constData()) != 0) {
+        QFile::remove(tmp);
+        return false;
+    }
+    return true;
+}
+
+// Any thread: every cached meta file, by library id.
+QHash<QString, QJsonObject> readAllMeta(const QString &dir)
+{
+    QHash<QString, QJsonObject> all;
+    const QFileInfoList files = QDir(dir).entryInfoList({QStringLiteral("*.json")}, QDir::Files);
+    for (const QFileInfo &fi : files) {
+        QFile f(fi.filePath());
+        if (f.open(QIODevice::ReadOnly)) all.insert(fi.completeBaseName(), QJsonDocument::fromJson(f.readAll()).object());
+    }
+    return all;
 }
 
 // Rank image candidates: language preference, then (optionally) PNG, then votes, then width.
@@ -144,10 +182,11 @@ Tmdb::Tmdb(Library *lib, QObject *parent) : QObject(parent), m_lib(lib)
     m_nam.setRedirectPolicy(QNetworkRequest::NoLessSafeRedirectPolicy);
     m_nam.setTransferTimeout(kTimeoutMs);
 
-    m_pumpTimer = new QTimer(this);
-    m_pumpTimer->setSingleShot(true);
-    m_pumpTimer->setInterval(kBurstDelayMs);
-    connect(m_pumpTimer, &QTimer::timeout, this, &Tmdb::pump);
+    m_apiPauseTimer = new QTimer(this);
+    m_apiPauseTimer->setSingleShot(true);
+    connect(m_apiPauseTimer, &QTimer::timeout, this, &Tmdb::pump);
+    m_ioPool.setMaxThreadCount(1); // in order: a meta file is never overwritten by an older write
+    m_ioPool.setExpiryTimeout(10000);
 
     m_syncTimer = new QTimer(this);
     m_syncTimer->setSingleShot(true);
@@ -168,10 +207,35 @@ Tmdb::Tmdb(Library *lib, QObject *parent) : QObject(parent), m_lib(lib)
     if (enabled()) validateKey();
     else setStatus(QStringLiteral("Not configured — add an API key"));
     scheduleSync(); // apply the on-disk cache right away (offline, before any network)
+    // ... once it is read, off the UI thread
+    const QString dir = cacheDir() + QStringLiteral("/meta");
+    m_ioPool.start([this, dir]() {
+        const QHash<QString, QJsonObject> all = readAllMeta(dir);
+        QMetaObject::invokeMethod(this, [this, all]() { metaLoaded(all); }, Qt::QueuedConnection);
+    });
+}
+
+void Tmdb::metaLoaded(const QHash<QString, QJsonObject> &all)
+{
+    if (m_metaLoaded) return; // clearCache() came first: what was read is gone
+    for (auto it = all.cbegin(); it != all.cend(); ++it)
+        if (!m_cache.contains(it.key())) m_cache.insert(it.key(), it.value()); // in-session results are newer
+    m_metaLoaded = true;
+    qCDebug(lcTmdb) << "meta cache loaded:" << all.size() << "titles";
+    if (std::exchange(m_syncWanted, false)) onLibraryChanged();
+}
+
+void Tmdb::ioThen(std::function<bool()> work, std::function<void(bool)> then)
+{
+    m_ioPool.start([this, work = std::move(work), then = std::move(then)]() {
+        const bool ok = work();
+        if (then) QMetaObject::invokeMethod(this, [then, ok]() { then(ok); }, Qt::QueuedConnection);
+    });
 }
 
 Tmdb::~Tmdb()
 {
+    m_ioPool.waitForDone(); // pending cache writes; their main-thread continuations are dropped with us
     for (auto it = m_inFlight.begin(); it != m_inFlight.end(); ++it) {
         it.key()->disconnect(this);
         it.key()->abort();
@@ -304,20 +368,24 @@ void Tmdb::fetchFile(const QUrl &url, std::function<void(const Reply &)> cb)
 
 void Tmdb::enqueue(const RequestPtr &r)
 {
-    if (r->interactive) {
+    if (!r->api) {
+        m_imgQueue.append(r);
+    } else if (r->interactive) {
         int i = 0;
         while (i < m_queue.size() && m_queue.at(i)->interactive) ++i;
         m_queue.insert(i, r);
     } else {
         m_queue.append(r);
     }
-    if (m_inFlight.size() < kMaxInFlight && !m_pumpTimer->isActive()) pump();
+    pump();
 }
 
 void Tmdb::pump()
 {
-    while (m_inFlight.size() < kMaxInFlight && !m_queue.isEmpty())
+    while (m_apiInFlight < kMaxApiInFlight && !m_queue.isEmpty() && !m_apiPauseTimer->isActive())
         startRequest(m_queue.takeFirst());
+    while (m_imgInFlight < kMaxImageInFlight && !m_imgQueue.isEmpty())
+        startRequest(m_imgQueue.takeFirst());
 }
 
 void Tmdb::startRequest(const RequestPtr &r)
@@ -333,15 +401,15 @@ void Tmdb::startRequest(const RequestPtr &r)
     }
     QNetworkReply *reply = m_nam.get(req);
     m_inFlight.insert(reply, r);
+    ++(r->api ? m_apiInFlight : m_imgInFlight);
     ++r->attempts;
-    qCDebug(lcTmdb) << "GET" << r->url.toString(QUrl::RemoveQuery) << "in flight" << m_inFlight.size();
+    qCDebug(lcTmdb) << "GET" << r->url.toString(QUrl::RemoveQuery) << "in flight" << m_apiInFlight << m_imgInFlight;
     connect(reply, &QNetworkReply::finished, this, [this, reply]() {
         const RequestPtr fin = m_inFlight.take(reply);
         reply->deleteLater();
         if (!fin) return;
-        // refill free slots after a short breather
-        if (!m_queue.isEmpty() && !m_pumpTimer->isActive()) m_pumpTimer->start();
-        if (!fin->interactive && fin->gen != m_gen) return; // stale (aborted generation)
+        --(fin->api ? m_apiInFlight : m_imgInFlight);
+        if (!fin->interactive && fin->gen != m_gen) { pump(); return; } // stale (aborted generation)
 
         Reply rep;
         rep.http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
@@ -352,12 +420,24 @@ void Tmdb::startRequest(const RequestPtr &r)
         if (rep.http == 429 && fin->attempts < 4) {   // rate limited: retry after the advertised delay
             int secs = reply->rawHeader("Retry-After").toInt();
             if (secs <= 0) secs = 2;
-            const quint64 gen = m_gen;
-            QTimer::singleShot(std::min(secs, 30) * 1000, this, [this, fin, gen]() {
-                if (fin->interactive || fin->gen == gen) enqueue(fin);
-            });
+            secs = std::min(secs, 30);
+            if (fin->api) {
+                // the whole API lane backs off; the request goes back to the front of its queue
+                qCInfo(lcTmdb) << "rate limited, pausing API requests for" << secs << "s";
+                if (!m_apiPauseTimer->isActive() || m_apiPauseTimer->remainingTime() < secs * 1000)
+                    m_apiPauseTimer->start(secs * 1000);
+                int i = 0;
+                if (!fin->interactive)
+                    while (i < m_queue.size() && m_queue.at(i)->interactive) ++i;
+                m_queue.insert(i, fin);
+            } else {
+                const quint64 gen = m_gen;
+                QTimer::singleShot(secs * 1000, this, [this, fin, gen]() { if (fin->gen == gen) enqueue(fin); });
+            }
+            pump();
             return;
         }
+        pump(); // refill the free slot right away
         if (rep.http >= 500 && fin->attempts < 2) {   // transient server error: one retry
             QTimer::singleShot(1500, this, [this, fin]() { if (fin->interactive || fin->gen == m_gen) enqueue(fin); });
             return;
@@ -372,15 +452,18 @@ void Tmdb::abortAll()
     ++m_gen;
     m_queue.erase(std::remove_if(m_queue.begin(), m_queue.end(), [](const RequestPtr &r) { return !r->interactive; }),
                   m_queue.end());
+    m_imgQueue.clear();
     const auto replies = m_inFlight.keys();
     for (QNetworkReply *reply : replies) {
-        if (m_inFlight.value(reply)->interactive) continue;
+        const RequestPtr r = m_inFlight.value(reply);
+        if (r->interactive) continue;
+        --(r->api ? m_apiInFlight : m_imgInFlight);
         m_inFlight.remove(reply);
         reply->disconnect(this);
         reply->abort();
         reply->deleteLater();
     }
-    if (!m_queue.isEmpty()) pump();
+    pump();
 }
 
 // ---- key validation ---------------------------------------------------------------------------------------------
@@ -437,7 +520,8 @@ QJsonObject Tmdb::loadMeta(const QString &id)
 {
     auto it = m_cache.constFind(id);
     if (it != m_cache.constEnd()) return it.value();
-    QJsonObject o;
+    if (m_metaLoaded) return {}; // m_cache holds everything on disk (writes go through it)
+    QJsonObject o;               // only before the background load finished
     QFile f(metaFile(id));
     if (f.open(QIODevice::ReadOnly)) o = QJsonDocument::fromJson(f.readAll()).object();
     m_cache.insert(id, o);
@@ -447,12 +531,8 @@ QJsonObject Tmdb::loadMeta(const QString &id)
 void Tmdb::saveMeta(const QString &id, const QJsonObject &o)
 {
     m_cache.insert(id, o);
-    QDir().mkpath(cacheDir() + QStringLiteral("/meta"));
-    QSaveFile f(metaFile(id));
-    if (f.open(QIODevice::WriteOnly)) {
-        f.write(QJsonDocument(o).toJson(QJsonDocument::Indented));
-        f.commit();
-    }
+    const QString file = metaFile(id);
+    ioThen([file, o]() { return writeFileAtomic(file, QJsonDocument(o).toJson(QJsonDocument::Indented)); });
 }
 
 void Tmdb::loadOverrides()
@@ -466,21 +546,20 @@ void Tmdb::loadOverrides()
 void Tmdb::saveOverrides()
 {
     const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    QDir().mkpath(dir);
     QJsonObject o;
     for (auto it = m_overrides.begin(); it != m_overrides.end(); ++it) o.insert(it.key(), it.value());
-    QSaveFile f(dir + QStringLiteral("/tmdb_overrides.json"));
-    if (f.open(QIODevice::WriteOnly)) {
-        f.write(QJsonDocument(o).toJson(QJsonDocument::Indented));
-        f.commit();
-    }
+    const QString file = dir + QStringLiteral("/tmdb_overrides.json");
+    ioThen([file, o]() { return writeFileAtomic(file, QJsonDocument(o).toJson(QJsonDocument::Indented)); });
 }
 
 void Tmdb::applyMeta(const QString &id, const QJsonObject &o, bool force)
 {
     if (!o.value(QStringLiteral("matched")).toBool()) return;
     // Skip titles whose overlay the Library still holds (avoids churn on every libraryChanged).
-    if (!force && m_lib->title(id).value(QStringLiteral("hasMeta")).toBool()) return;
+    if (!force) {
+        const Title *t = m_lib->findTitle(id);
+        if (t && t->hasExternalMeta) return;
+    }
     const QVariantMap meta = toApplyMap(o.value(QStringLiteral("meta")).toObject());
     m_applying = true;
     m_lib->setExternalMetadata(id, meta);
@@ -511,18 +590,32 @@ void Tmdb::revertMeta(const QString &id, const QJsonObject &o)
 // Screen recordings, dated captures and ticket-style clip names: never sent to TMDB.
 bool Tmdb::isJunk(const QString &id, const QVariantMap &ident) const
 {
-    static const QRegularExpression words(QStringLiteral("record|screencast|screen|kooha|capture|obs[ _-]|vokoscreen"),
-                                          QRegularExpression::CaseInsensitiveOption);
-    static const QRegularExpression date(QStringLiteral(
-        "(\\b|_)(19|20)\\d\\d[-_.](0?[1-9]|1[0-2])[-_.](0?[1-9]|[12]\\d|3[01])"   // 2026-08-05
-        "|(\\b|_)(0?[1-9]|1[0-2])[-_./](0?[1-9]|[12]\\d|3[01])[-_./](19|20)\\d\\d"  // 6_7_2026
-        "|(19|20)\\d{6}[-_ ]?\\d{4,6}"));                                           // 20260607_112735
+    // recording words and dates in one pattern (the date part has no letters, case doesn't matter)
+    static const QRegularExpression wordsOrDate(QStringLiteral(
+        "record|screencast|screen|kooha|capture|obs[ _-]|vokoscreen"
+        "|(\\b|_)(19|20)\\d\\d[-_.](0?[1-9]|1[0-2])[-_.](0?[1-9]|[12]\\d|3[01])"  // 2026-08-05
+        "|(\\b|_)(0?[1-9]|1[0-2])[-_./](0?[1-9]|[12]\\d|3[01])[-_./](19|20)\\d\\d" // 6_7_2026
+        "|(19|20)\\d{6}[-_ ]?\\d{4,6}"),                                          // 20260607_112735
+        QRegularExpression::CaseInsensitiveOption);
     static const QRegularExpression ticket(QStringLiteral("^[A-Z]{2,}-\\d+"));
     const QString t = ident.value(QStringLiteral("title")).toString();
     if (t.trimmed().isEmpty()) return true;
-    if (words.match(t).hasMatch() || date.match(t).hasMatch() || ticket.match(t).hasMatch()) return true;
-    const QString file = QFileInfo(m_lib->title(id).value(QStringLiteral("path")).toString()).fileName();
-    return words.match(file).hasMatch() || date.match(file).hasMatch() || ticket.match(file).hasMatch();
+    // the file the title plays first (movie / first regular episode)
+    QString file;
+    if (const Title *title = m_lib->findTitle(id)) {
+        for (const MediaFile &f : title->files)
+            if (!title->isSeries || f.season != 0) { file = f.path; break; }
+        if (file.isEmpty() && !title->files.isEmpty()) file = title->files.first().path;
+    }
+    file = QFileInfo(file).fileName();
+    // memo: the regexes only run when a title or its file name changes
+    const QString memoKey = t + u'\n' + file;
+    const auto memo = m_junk.constFind(id);
+    if (memo != m_junk.cend() && memo->first == memoKey) return memo->second;
+    auto junk = [](const QString &s) { return wordsOrDate.match(s).hasMatch() || ticket.match(s).hasMatch(); };
+    const bool result = junk(t) || junk(file);
+    m_junk.insert(id, {memoKey, result});
+    return result;
 }
 
 bool Tmdb::needsFetch(const QString &id, const QVariantMap &ident, const QJsonObject &o) const
@@ -564,6 +657,9 @@ void Tmdb::scheduleSync()
 
 void Tmdb::onLibraryChanged()
 {
+    QElapsedTimer passTimer;
+    passTimer.start();
+    if (!m_metaLoaded) { m_syncWanted = true; return; } // metaLoaded() syncs
     m_ids = m_lib->allTitles()->ids();
     const bool canFetch = enabled() && m_keyState == KeyState::Valid;
     // Featured title first, so the billboard updates early.
@@ -599,6 +695,7 @@ void Tmdb::onLibraryChanged()
     updateStats();
     startMoreJobs();
     updateStatus();
+    qCDebug(lcTmdb, "sync pass: %d titles in %.2f ms (UI thread)", int(m_ids.size()), passTimer.nsecsElapsed() / 1e6);
 }
 
 void Tmdb::queueJob(const QString &id, bool force, bool front, int tmdbId, bool series, bool explicitMap)
@@ -690,26 +787,67 @@ void Tmdb::runSearch(const JobPtr &job)
     });
 }
 
+// One request for details + certification + images (+ the library's seasons, as many as fit) using
+// append_to_response; seasons that don't fit are fetched separately in detailsDone().
 void Tmdb::fetchDetails(const JobPtr &job)
 {
     const QString base = (job->series ? QStringLiteral("/tv/") : QStringLiteral("/movie/")) + QString::number(job->tmdbId);
-    const bool prio = job->explicitMap;
-    job->outstanding = 3;
-    auto handle = [this, job](const Reply &r, QJsonObject Job::*slot, bool required) {
+    const QString ratingsKey = job->series ? QStringLiteral("content_ratings") : QStringLiteral("release_dates");
+    QStringList append{ratingsKey, QStringLiteral("images")};
+    for (int season : std::as_const(job->seasons))
+        if (append.size() < kMaxAppend) append << QStringLiteral("season/%1").arg(season);
+    const QList<QPair<QString, QString>> query{{QStringLiteral("language"), QStringLiteral("en-US")},
+                                               {QStringLiteral("append_to_response"), append.join(u',')},
+                                               {QStringLiteral("include_image_language"), QStringLiteral("en,null")}};
+    apiGet(base, query, job->explicitMap, [this, job, ratingsKey](const Reply &r) {
         if (!alive(job)) return;
-        if (required) job->detailsHttp = r.http;
-        if (r.http == 200) (*job).*slot = r.json();
-        else if (r.http == 401) { onAuthFailed(); return; }
-        else if (r.netError) job->netError = true;
-        else if (required) qCInfo(lcTmdb) << "details failed" << job->tmdbId << r.http;
-        if (--job->outstanding == 0) detailsDone(job);
-    };
-    const QList<QPair<QString, QString>> lang{{QStringLiteral("language"), QStringLiteral("en-US")}};
-    apiGet(base, lang, prio, [handle](const Reply &r) { handle(r, &Job::details, true); });
-    apiGet(base + (job->series ? QStringLiteral("/content_ratings") : QStringLiteral("/release_dates")), {}, prio,
-           [handle](const Reply &r) { handle(r, &Job::ratings, false); });
-    apiGet(base + QStringLiteral("/images"), {{QStringLiteral("include_image_language"), QStringLiteral("en,null")}}, prio,
-           [handle](const Reply &r) { handle(r, &Job::images, false); });
+        job->detailsHttp = r.http;
+        if (r.http == 200) {
+            job->details = r.json();
+            job->ratings = job->details.value(ratingsKey).toObject();
+            job->images = job->details.value(QStringLiteral("images")).toObject();
+        } else if (r.http == 401) {
+            onAuthFailed();
+            return;
+        } else if (r.netError) {
+            job->netError = true;
+        } else {
+            qCInfo(lcTmdb) << "details failed" << job->tmdbId << r.http;
+        }
+        detailsDone(job);
+    });
+}
+
+// Records a season's episodes that exist locally and downloads their stills. Caller holds a jobStep guard.
+void Tmdb::addSeason(const JobPtr &job, int season, const QJsonObject &data)
+{
+    const QString key = (job->series ? QStringLiteral("tv-") : QStringLiteral("movie-")) + QString::number(job->tmdbId);
+    const QString imgDir = cacheDir() + QStringLiteral("/images/");
+    const QSet<int> local = job->localEpisodes.value(QString::number(season));
+    for (const QJsonValue &v : data.value(QStringLiteral("episodes")).toArray()) {
+        const QJsonObject e = v.toObject();
+        const int ep = e.value(QStringLiteral("episode_number")).toInt();
+        if (!local.contains(ep)) continue;
+        QJsonObject em{{QStringLiteral("season"), season}, {QStringLiteral("episode"), ep},
+                       {QStringLiteral("title"), e.value(QStringLiteral("name")).toString()},
+                       {QStringLiteral("description"), e.value(QStringLiteral("overview")).toString()}};
+        const int idx = job->episodes.size();
+        job->episodes.append(em);
+        const QString still = e.value(QStringLiteral("still_path")).toString();
+        if (still.isEmpty()) continue;
+        const QString file = imgDir + key + QStringLiteral("-s%1e%2.").arg(season, 2, 10, QChar(u'0')).arg(ep, 2, 10, QChar(u'0'))
+                             + extOf(still, QStringLiteral("jpg"));
+        ++job->outstanding;
+        // shown at ~400x225 (episode list); w300 looked soft
+        download(job, still, QStringLiteral("w500"), file, QString(), [this, job, idx, file](bool ok) {
+            if (ok) {
+                QJsonObject epObj = job->episodes.at(idx).toObject();
+                epObj.insert(QStringLiteral("stillFile"), file);
+                job->episodes.replace(idx, epObj);
+            }
+            jobStep(job);
+        });
+    }
 }
 
 void Tmdb::detailsDone(const JobPtr &job)
@@ -764,8 +902,7 @@ void Tmdb::detailsDone(const JobPtr &job)
     if (backdrop.isEmpty()) backdrop = d.value(QStringLiteral("backdrop_path")).toString();
 
     const QString key = (job->series ? QStringLiteral("tv-") : QStringLiteral("movie-")) + QString::number(job->tmdbId);
-    const QString imgDir = cacheDir() + QStringLiteral("/images/");
-    QDir().mkpath(imgDir);
+    const QString imgDir = cacheDir() + QStringLiteral("/images/"); // created by the first write
 
     job->outstanding = 1; // guard while scheduling
     auto addImage = [&](const QString &remote, const QString &size, const QString &kind, const QString &metaKey) {
@@ -791,38 +928,19 @@ void Tmdb::detailsDone(const JobPtr &job)
 
     if (job->series) {
         for (int season : std::as_const(job->seasons)) {
+            const QString appended = QStringLiteral("season/%1").arg(season);
+            if (d.contains(appended)) { // came with the details
+                addSeason(job, season, d.value(appended).toObject());
+                continue;
+            }
+            if (job->seasons.indexOf(season) + 2 < kMaxAppend) continue; // was asked for: TMDB doesn't know it
             ++job->outstanding;
             apiGet(QStringLiteral("/tv/%1/season/%2").arg(job->tmdbId).arg(season), {{QStringLiteral("language"), QStringLiteral("en-US")}},
-                   job->explicitMap, [this, job, season, key, imgDir](const Reply &r) {
+                   job->explicitMap, [this, job, season](const Reply &r) {
                 if (!alive(job)) return;
                 if (r.http == 401) { onAuthFailed(); return; }
                 if (r.netError) job->netError = true;
-                if (r.http == 200) {
-                    const QSet<int> local = job->localEpisodes.value(QString::number(season));
-                    for (const QJsonValue &v : r.json().value(QStringLiteral("episodes")).toArray()) {
-                        const QJsonObject e = v.toObject();
-                        const int ep = e.value(QStringLiteral("episode_number")).toInt();
-                        if (!local.contains(ep)) continue;
-                        QJsonObject em{{QStringLiteral("season"), season}, {QStringLiteral("episode"), ep},
-                                       {QStringLiteral("title"), e.value(QStringLiteral("name")).toString()},
-                                       {QStringLiteral("description"), e.value(QStringLiteral("overview")).toString()}};
-                        const int idx = job->episodes.size();
-                        job->episodes.append(em);
-                        const QString still = e.value(QStringLiteral("still_path")).toString();
-                        if (still.isEmpty()) continue;
-                        const QString file = imgDir + key + QStringLiteral("-s%1e%2.").arg(season, 2, 10, QChar(u'0')).arg(ep, 2, 10, QChar(u'0'))
-                                             + extOf(still, QStringLiteral("jpg"));
-                        ++job->outstanding;
-                        download(job, still, QStringLiteral("w300"), file, QString(), [this, job, idx, file](bool ok) {
-                            if (ok) {
-                                QJsonObject epObj = job->episodes.at(idx).toObject();
-                                epObj.insert(QStringLiteral("stillFile"), file);
-                                job->episodes.replace(idx, epObj);
-                            }
-                            jobStep(job);
-                        });
-                    }
-                }
+                if (r.http == 200) addSeason(job, season, r.json());
                 jobStep(job);
             });
         }
@@ -841,13 +959,14 @@ void Tmdb::download(const JobPtr &job, const QString &remotePath, const QString 
             QString target = file;
             if (r.body.startsWith("<?xml") || r.body.startsWith("<svg")) // server sent the SVG itself
                 target = file.left(file.lastIndexOf(u'.')) + QStringLiteral(".svg");
-            QSaveFile f(target);
-            if (f.open(QIODevice::WriteOnly) && f.write(r.body) == r.body.size() && f.commit()) {
+            const QByteArray body = r.body;
+            ioThen([target, file, body]() {
+                if (!writeFileAtomic(target, body)) return false;
                 if (target != file) QFile::remove(file); // finishJob() points the overlay at the .svg
-                done(true);
-                return;
-            }
-            done(false);
+                return true;
+            }, [this, job, done](bool ok) {
+                if (alive(job)) done(ok);
+            });
             return;
         }
         if (r.netError) job->netError = true;
@@ -943,6 +1062,7 @@ void Tmdb::endJob(const JobPtr &job)
     updateStats();
     startMoreJobs();
     updateStatus();
+    if (m_jobs.isEmpty()) emit idle(); // batch done: every title has its final artwork state
 }
 
 // ---- invokables -------------------------------------------------------------------------------------------------
@@ -954,7 +1074,6 @@ void Tmdb::refreshAll()
     m_jobs.clear();
     m_waiting.clear();
     m_batchTotal = m_batchDone = m_batchNetFail = 0;
-    m_cache.clear(); // re-read from disk
     if (m_keyState != KeyState::Valid) { validateKey(); return; }
     m_ids = m_lib->allTitles()->ids();
     for (const QString &id : std::as_const(m_ids)) {
@@ -989,6 +1108,7 @@ void Tmdb::refreshTitle(const QString &id)
 
 void Tmdb::clearCache()
 {
+    m_ioPool.waitForDone(); // pending cache writes must not recreate files after the removal
     abortAll();
     m_jobs.clear();
     m_waiting.clear();
@@ -1006,6 +1126,7 @@ void Tmdb::clearCache()
             revertMeta(it.key(), it.value());
     QDir(cacheDir()).removeRecursively();
     m_cache.clear();
+    m_metaLoaded = true; // the (now empty) cache is complete
     for (auto it = m_state.begin(); it != m_state.end(); ++it)
         if (it.value() == QLatin1String("matched") || it.value() == QLatin1String("notFound") || it.value() == QLatin1String("pending"))
             it.value() = QStringLiteral("new");
@@ -1059,8 +1180,9 @@ void Tmdb::assign(const QString &id, int tmdbId, bool series)
         if (m_jobs.remove(id)) { m_waiting.removeAll(id); ++m_batchDone; }
         const QJsonObject o = loadMeta(id);
         if (o.value(QStringLiteral("matched")).toBool()) revertMeta(id, o);
-        m_cache.remove(id);
-        QFile::remove(metaFile(id));
+        m_cache.insert(id, QJsonObject()); // known: no meta file (m_cache is authoritative once loaded)
+        const QString file = metaFile(id);
+        ioThen([file]() { return QFile::remove(file); });
         m_state[id] = QStringLiteral("ignored");
         updateStats();
         startMoreJobs();
@@ -1073,6 +1195,20 @@ void Tmdb::assign(const QString &id, int tmdbId, bool series)
     updateStats();
     startMoreJobs();
     updateStatus();
+}
+
+bool Tmdb::expectsArtwork(const QString &id) const
+{
+    if (!m_metaLoaded) return false;
+    const QJsonObject o = m_cache.value(id);
+    if (o.value(QStringLiteral("matched")).toBool()) {
+        const QJsonObject meta = o.value(QStringLiteral("meta")).toObject();
+        return !meta.value(QStringLiteral("posterFile")).toString().isEmpty()
+               || !meta.value(QStringLiteral("backdropFile")).toString().isEmpty();
+    }
+    if (m_jobs.contains(id)) return true;
+    // not looked up yet but will be once the key works (onLibraryChanged queues "new" titles)
+    return enabled() && m_keyState != KeyState::Invalid && m_state.value(id) == QLatin1String("new");
 }
 
 QVariantMap Tmdb::titleState(const QString &id) const
