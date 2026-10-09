@@ -36,7 +36,6 @@ QtObject {
     // Viewport-relative sizing (Netflix sizes its browse UI in vw).
     // `windowWidth` is fed by NavBar (always present, anchored to the window's full width) through a
     // Binding on its own width, so every component can use Theme.vw(x) without knowing the window.
-    // Screens without a NavBar (profiles, intro) use their own width.
     // ---------------------------------------------------------------------------------------------
     property real windowWidth: 1600
     function vw(x: real): real { return windowWidth * x / 100 }
@@ -69,42 +68,6 @@ QtObject {
     property alias autoplayPreviews: uiSettings.autoplayPreviews
     property alias previewMuted: uiSettings.previewMuted
 
-    // Profiles shown on the profile gate / nav dropdown. Persisted as JSON under profiles/list,
-    // the chosen one under profiles/current.
-    property Settings profileSettings: Settings {
-        id: profileSettings
-        category: "profiles"
-        property string list: ""
-        property string current: ""
-    }
-    readonly property var defaultProfiles: [
-        { name: "Me",     color: "#0071EB", avatar: 0 },
-        { name: "Guest",  color: "#E50914", avatar: 1 },
-        { name: "Family", color: "#F5A623", avatar: 2 },
-        { name: "Kids",   color: "#1CE783", avatar: 3 }
-    ]
-    property var profiles: {
-        try {
-            const l = JSON.parse(profileSettings.list)
-            if (Array.isArray(l) && l.length > 0) return l
-        } catch (e) {}
-        return defaultProfiles
-    }
-    function setProfiles(list: var) { profiles = list; profileSettings.list = JSON.stringify(list) }
-    function selectProfile(p: var) {
-        if (!p) return
-        Nav.profileName = p.name; Nav.profileColor = p.color; Nav.profileAvatar = p.avatar
-        profileSettings.current = p.name
-    }
-    function restoreProfile() {
-        const want = profileSettings.current
-        for (let i = 0; i < profiles.length; ++i)
-            if (profiles[i].name === want || (want === "" && i === 0)) {
-                Nav.profileName = profiles[i].name; Nav.profileColor = profiles[i].color; Nav.profileAvatar = profiles[i].avatar
-                return
-            }
-    }
-    Component.onCompleted: restoreProfile()
 
     function relativeDate(added: var): string {
         const d = new Date(added)

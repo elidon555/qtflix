@@ -269,10 +269,6 @@ ApplicationWindow {
         // Clear watch history
         () => { clickOn(byName(page(), "clearHistoryButton")); return 600 },
         () => { check("Clear watch history empties Continue Watching", Library.continueWatching.count === 0, Library.continueWatching.count); return 100 },
-        // profile persistence (QSettings profiles/current)
-        () => { Theme.selectProfile(Theme.profiles[1]); return 100 },
-        () => { check("chosen profile persisted", Theme.profileSettings.current === Theme.profiles[1].name && Nav.profileName === Theme.profiles[1].name)
-                Theme.selectProfile(Theme.profiles[0]); return 100 },
         // autoplay off is honored by the billboard
         () => { Theme.autoplayPreviews = false; Nav.go("home"); return 4500 },
         () => { check("billboard does not autoplay when previews are off", page().billboard.mediaLoaded === false && !page().billboard.videoShown)

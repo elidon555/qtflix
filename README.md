@@ -14,7 +14,6 @@ sudo apt install cmake ninja-build qt6-base-dev qt6-declarative-dev qt6-multimed
   qml6-module-qtquick-templates qml6-module-qtquick-effects qml6-module-qtquick-shapes qml6-module-qtquick-dialogs \
   qml6-module-qtqml-workerscript qml6-module-qtmultimedia qml6-module-qtcore libqt6svg6 fonts-inter ffmpeg
 ./run.sh            # builds into ./build and launches
-./run.sh --no-intro # skip the intro animation
 ```
 
 ```

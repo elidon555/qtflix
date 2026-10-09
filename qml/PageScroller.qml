@@ -18,6 +18,12 @@ QtObject {
         else { anim.to = view.originY + targetY; anim.restart() }
     }
     onMaxYChanged: if (scrollY > maxY) scrollTo(maxY, false)
+    // A header that grows after creation (the billboard sizes itself once the window has its size) moves originY
+    // while contentY stays, which would leave an unscrolled page part-way down: stay pinned to the top.
+    readonly property Connections pinTop: Connections {
+        target: s.view
+        function onOriginYChanged() { if (s.targetY === 0 && !s.anim.running) s.view.contentY = s.view.originY }
+    }
 
     function wheel(ev: WheelEvent) {
         if (ev.pixelDelta.y !== 0) {

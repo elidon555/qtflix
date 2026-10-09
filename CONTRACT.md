@@ -20,9 +20,9 @@ subdirectories). Assets live in `assets/` and are available as `qrc:/assets/<fil
 
 ## Screens / components and who owns them
 - `Main.qml` (integration, written by lead): `ApplicationWindow` 1600x900 min 1100x650, background Theme.bg.
-  Shows `IntroScreen` -> `ProfilesScreen` -> browse pages inside a `Flickable`/`ScrollView` under a `NavBar`;
+  Opens straight on the browse pages inside a `Flickable`/`ScrollView` under a `NavBar`;
   `DetailModal` overlay when `Nav.detailId !== ""`; `Player` overlay when `Nav.playerPath !== ""`.
-- Browse agent owns: `IntroScreen.qml`, `ProfilesScreen.qml`, `NavBar.qml`, `Billboard.qml`, `TitleRow.qml`,
+- Browse agent owns: `NavBar.qml`, `Billboard.qml`, `TitleRow.qml`,
   `TitleCard.qml`, `HoverPreview.qml`, `Top10Card.qml`, `HomePage.qml`, `BrowsePage.qml` (tv/movies/new/mylist
   — takes a `RowsModel` or a `TitleModel` grid), `SearchPage.qml`, `SettingsPage.qml`, `DetailModal.qml`,
   `BrandLogo.qml` (qtflix ring mark + wordmark, `assets/mark.svg`), plus any assets they need.

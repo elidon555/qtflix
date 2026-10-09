@@ -27,7 +27,6 @@ Item {
                     { label: "Settings", act: function () { Nav.go("settings") } },
                     { label: "Rescan library", act: function () { Library.rescan() } },
                     { label: "My List", act: function () { Nav.go("mylist") } },
-                    { label: "Switch profile", act: function () { Nav.go("profiles") } },
                     { label: "Source code", act: function () { Qt.openUrlExternally(root.repo) } },
                     { label: "Report an issue", act: function () { Qt.openUrlExternally(root.repo + "/issues") } },
                     { label: "License", act: function () { Qt.openUrlExternally(root.repo + "/blob/main/LICENSE") } },

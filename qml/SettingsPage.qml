@@ -70,7 +70,7 @@ FocusScope {
                 Avatar { width: Math.round(page.fs * 1.5); height: width; avatarColor: Nav.profileColor; variant: Nav.profileAvatar; anchors.verticalCenter: parent.verticalCenter }
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
-                    text: Nav.profileName + " · " + Library.titleCount + (Library.titleCount === 1 ? " title" : " titles") + " in your library"
+                    text: Library.titleCount + (Library.titleCount === 1 ? " title" : " titles") + " in your library"
                     color: "#B3B3B3"; font.family: Theme.font; font.pixelSize: page.fs
                 }
             }
@@ -175,18 +175,6 @@ FocusScope {
                                                       : "Removes resume points and the Continue Watching row. My List is kept."
                     last: true
                     NfFlatButton { objectName: "clearHistoryButton"; label: "Clear watch history"; onClicked: page.clearWatchHistory() }
-                }
-            }
-
-            // ---------------- Profile ----------------
-            SectionHeader { text: "Profile" }
-            Card {
-                SettingRow {
-                    title: Nav.profileName
-                    subtitle: "Profiles are saved on this computer."
-                    last: true
-                    leading: Avatar { width: Math.round(page.fs * 2.8); height: width; avatarColor: Nav.profileColor; variant: Nav.profileAvatar }
-                    NfFlatButton { label: "Manage profiles"; onClicked: Nav.go("profiles") }
                 }
             }
         }

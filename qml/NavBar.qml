@@ -190,15 +190,6 @@ Item {
             }
         }
 
-        Text {
-            anchors.verticalCenter: parent.verticalCenter
-            text: "Kids"
-            font.family: Theme.font; font.pixelSize: root.fs
-            color: kma.containsMouse ? "#B3B3B3" : "white"
-            Behavior on color { ColorAnimation { duration: 400 } }
-            MouseArea { id: kma; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: Nav.go("profiles") }
-        }
-
         // bell with notification badge (hover opens the Notifications panel)
         Item {
             id: bell
@@ -294,32 +285,9 @@ Item {
             y: 2
             width: parent.width
             topPadding: 10
-            Repeater {
-                model: Theme.profiles
-                delegate: MenuItemRow {
-                    required property var modelData
-                    label: modelData.name
-                    avatarColor: modelData.color
-                    avatarVariant: modelData.avatar
-                    onActivated: { Theme.selectProfile(modelData); profile.menuOpen = false }
-                }
-            }
-            MenuItemRow { label: "Manage Profiles"; iconName: "pencil"; onActivated: { profile.menuOpen = false; Nav.go("profiles") } }
             MenuItemRow { label: "Settings"; iconName: "settings"; onActivated: { profile.menuOpen = false; Nav.go("settings") } }
             MenuItemRow { label: Library.scanning ? "Scanning…" : "Rescan library"; iconName: "replay"; onActivated: { profile.menuOpen = false; Library.rescan() } }
             Item { width: 1; height: 10 }
-            Rectangle { width: parent.width; height: 1; color: Qt.rgba(1, 1, 1, 0.25) }
-            Item {
-                width: parent.width; height: 44
-                Text {
-                    anchors.centerIn: parent
-                    text: "Switch profiles"
-                    color: "white"
-                    font.family: Theme.font; font.pixelSize: 13
-                    font.underline: swma.containsMouse
-                }
-                MouseArea { id: swma; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { profile.menuOpen = false; Nav.go("profiles") } }
-            }
         }
     }
 

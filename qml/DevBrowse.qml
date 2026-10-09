@@ -3,13 +3,13 @@ import QtQuick.Controls
 import QtFlix
 
 // Dev harness for the browse UI. Optional command-line switches (read via Qt.application.arguments):
-//   --page=<home|tv|movies|new|mylist|search|settings|intro|profiles>  start page (default home)
+//   --page=<home|tv|movies|new|mylist|search|settings>  start page (default home)
 //   --detail            open the detail modal on the first title once the library is loaded
 //   --detail-series     open the detail modal on the first series
 //   --preview=<row>     open the hover preview on the 2nd card of row <row> of the home page
 //   --search=<text>     type a search query
 //   --scroll=<px>       scroll the page
-//   --hover-nav         open the profile dropdown
+//   --hover-nav         open the account dropdown
 //   --modal-scroll=<px> scroll the detail modal
 //   --size=WxH          initial window size
 //   --next-page=<row>   page the given home row forward once
@@ -40,12 +40,9 @@ ApplicationWindow {
         if (sz) { const p = sz.split("x"); width = parseInt(p[0]); height = parseInt(p[1]) }
     }
 
-    readonly property bool browsing: Nav.page !== "intro" && Nav.page !== "profiles"
-
     Loader {
         id: pageLoader
         anchors.fill: parent
-        visible: win.browsing
         sourceComponent: {
             switch (Nav.page) {
             case "home": return homeC
@@ -81,26 +78,12 @@ ApplicationWindow {
 
     NavBar {
         id: nav
-        visible: win.browsing
         // the page types share no common base; each exposes scrollY
         scrollY: (pageLoader.item as HomePage)?.scrollY ?? (pageLoader.item as BrowsePage)?.scrollY
                  ?? (pageLoader.item as SearchPage)?.scrollY ?? (pageLoader.item as SettingsPage)?.scrollY ?? 0
     }
 
     DetailModal { id: modal }
-
-    Loader {
-        anchors.fill: parent
-        active: Nav.page === "profiles"
-        sourceComponent: ProfilesScreen { onChosen: Nav.go("home") }
-        onLoaded: (item as Item).forceActiveFocus()
-    }
-    Loader {
-        anchors.fill: parent
-        active: Nav.page === "intro"
-        sourceComponent: IntroScreen { onFinished: Nav.go("profiles") }
-        onLoaded: (item as Item).forceActiveFocus()
-    }
 
     // ---- scripted dev states ----
     Timer {
