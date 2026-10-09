@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Quick Qml QuickControls2 Multimedia Svg Concurrent Network)
+find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Quick Qml QuickControls2 Multimedia Svg Concurrent Network ShaderTools)
 qt_standard_project_setup(REQUIRES 6.5)
 qt_policy(SET QTP0001 NEW)
 
@@ -20,7 +20,7 @@ foreach(f ${QTFLIX_QML})
     file(RELATIVE_PATH rel ${CMAKE_CURRENT_SOURCE_DIR}/qml ${f})
     set_source_files_properties(${f} PROPERTIES QT_RESOURCE_ALIAS ${rel})
     get_filename_component(name ${f} NAME_WE)
-    if(name STREQUAL "Theme" OR name STREQUAL "Nav")
+    if(name STREQUAL "Theme" OR name STREQUAL "Nav" OR name STREQUAL "IconPaths")
         set_source_files_properties(${f} PROPERTIES QT_QML_SINGLETON_TYPE TRUE)
     endif()
 endforeach()
@@ -37,6 +37,12 @@ qt_add_qml_module(qtflix
     RESOURCE_PREFIX /
     NO_RESOURCE_TARGET_PATH
     NO_IMPORT_SCAN
+)
+
+# Shaders (compiled to .qsb at build time; ShaderEffect loads qrc:/shaders/<name>.qsb)
+qt_add_shaders(qtflix "qtflix_shaders"
+    PREFIX "/"
+    FILES shaders/roundedimage.frag
 )
 
 target_include_directories(qtflix PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -59,7 +65,7 @@ set(CPACK_DEBIAN_PACKAGE_SECTION video)
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "ffmpeg, fonts-inter, qml6-module-qtquick, qml6-module-qtquick-controls, \
 qml6-module-qtquick-layouts, qml6-module-qtquick-window, qml6-module-qtquick-templates, qml6-module-qtquick-effects, \
 qml6-module-qtquick-shapes, qml6-module-qtquick-dialogs, qml6-module-qtqml-workerscript, qml6-module-qtmultimedia, \
-qml6-module-qtcore, qml6-module-qt5compat-graphicaleffects, libqt6svg6")
+qml6-module-qtcore, libqt6svg6")
 include(CPack)
 
 # ---------------------------------------------------------------------------

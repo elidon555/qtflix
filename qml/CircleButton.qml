@@ -71,6 +71,7 @@ Item {
         }
         Rectangle {
             width: 12; height: 12; rotation: 45
+            antialiasing: true
             color: "#E6E6E6"
             anchors.horizontalCenter: parent.horizontalCenter
             y: tipBox.height - 7

@@ -13,7 +13,8 @@ import QtFlix
 //              page shown) destroys the MediaPlayer + VideoOutput (Loader) and unloads the source
 Item {
     id: root
-    property var title: ({})
+    property var title: ({})                 // title map (Library.featured / TitleModel.get())
+    readonly property TitleInfo titleInfo: TitleInfo {}   // typed copy of `title`
     property bool active: true
     property bool loaded: active
     property bool muted: Theme.previewMuted
@@ -21,8 +22,8 @@ Item {
     signal playClicked()
     signal moreInfoClicked()
 
-    readonly property bool hasTitle: !!title && !!title.id
-    readonly property bool hasLogo: hasTitle && !!title.logoImage && title.logoImage.toString() !== "" && logo.status !== Image.Error
+    readonly property bool hasTitle: titleInfo.valid
+    readonly property bool hasLogo: hasTitle && titleInfo.hasLogo && logo.status !== Image.Error
     width: parent ? parent.width : 1600
     height: Math.round(width * 0.5625)
     readonly property real vw: width / 100
@@ -33,12 +34,13 @@ Item {
     property bool videoEnded: false         // preview finished (shows replay)
     property bool collapsed: false          // logo shrunk + synopsis hidden
     property real seekTarget: 0
-    readonly property bool canLoad: loaded && visible && Theme.autoplayPreviews && hasTitle && !!title.sourceUrl
-                                    && title.sourceUrl.toString() !== "" && !videoEnded
+    readonly property bool canLoad: loaded && visible && Theme.autoplayPreviews && hasTitle
+                                    && titleInfo.hasSource && !videoEnded
     readonly property MediaPlayer player: mediaLoader.item ? loadedPlayer : null
     property MediaPlayer loadedPlayer: null  // set by the loaded MediaPlayer (Loader.item is an anonymous type)
 
-    onTitleChanged: { videoEnded = false; unload() }
+    onTitleChanged: { titleInfo.assign(title); videoEnded = false; unload() }
+    Component.onCompleted: titleInfo.assign(title)
     onCanLoadChanged: if (!canLoad) unload()
     onActiveChanged: {
         if (!player) return
@@ -76,16 +78,13 @@ Item {
     // ---------------- visuals ----------------
     Rectangle { anchors.fill: parent; color: Theme.bg }
 
-    Image {
+    RoundedImage {
         id: still
         anchors.fill: parent
-        source: root.hasTitle ? root.title.backdropImage : ""
-        fillMode: Image.PreserveAspectCrop
-        asynchronous: true
-        cache: true
-        sourceSize: Qt.size(Math.min(1920, root.width), Math.min(1080, root.height))
-        opacity: status === Image.Ready ? 1 : 0
-        Behavior on opacity { NumberAnimation { duration: 600 } }
+        radius: 0
+        bg: "transparent"
+        fadeDuration: 600
+        source: root.hasTitle ? root.titleInfo.backdropImage : ""
     }
 
     Loader {
@@ -96,7 +95,7 @@ Item {
             MediaPlayer {
                 id: mp
                 Component.onCompleted: root.loadedPlayer = mp
-                source: root.title.sourceUrl
+                source: root.titleInfo.sourceUrl
                 videoOutput: vout
                 audioOutput: AudioOutput { muted: root.muted; volume: 0.7 }
                 onMediaStatusChanged: {
@@ -198,7 +197,7 @@ Item {
 
                 // "N SERIES" / "N FILM" — only with real metadata
                 Row {
-                    visible: root.hasTitle && root.title.hasMeta === true
+                    visible: root.hasTitle && root.titleInfo.hasMeta
                     spacing: Math.round(root.vw * 0.35)
                     height: Math.round(Math.max(20, root.vw * 1.7))
                     Image {
@@ -211,7 +210,7 @@ Item {
                     Text {
                         anchors.verticalCenter: parent.verticalCenter
                         anchors.verticalCenterOffset: 1
-                        text: root.title && root.title.isSeries ? "S E R I E S" : "F I L M"
+                        text: root.titleInfo.isSeries ? "S E R I E S" : "F I L M"
                         color: "#E5E5E5"
                         font.family: Theme.font
                         font.pixelSize: Math.round(Math.max(11, root.vw * 0.95))
@@ -225,7 +224,7 @@ Item {
                 Image {
                     id: logo
                     visible: root.hasLogo
-                    source: root.hasTitle && root.title.logoImage ? root.title.logoImage : ""
+                    source: root.hasTitle && root.titleInfo.hasLogo ? root.titleInfo.logoImage : ""
                     asynchronous: true
                     cache: true
                     fillMode: Image.PreserveAspectFit
@@ -243,7 +242,7 @@ Item {
                     id: titleText
                     visible: !root.hasLogo
                     width: parent.width
-                    text: root.hasTitle ? root.title.title : ""
+                    text: root.titleInfo.title
                     font.pixelSize: Math.round(text.length > 24 ? root.vw * 2.6 : root.vw * 3.5)
                     font.family: Theme.font
                     font.weight: Font.ExtraBold
@@ -269,7 +268,7 @@ Item {
                 id: synopsis
                 y: Math.round(root.vw * 1.2)
                 width: parent.width
-                text: root.hasTitle ? (root.title.description || "") : ""
+                text: root.titleInfo.description
                 color: "white"
                 font.family: Theme.font
                 font.pixelSize: Math.round(Math.max(13, root.vw * 1.2))
@@ -288,13 +287,13 @@ Item {
                 objectName: "billboardPlay"
                 text: "Play"; iconName: "play"; primary: true
                 fontSize: Math.round(Math.max(14, root.vw * 1.2))
-                onClicked: { root.playClicked(); Nav.play(root.title.path) }
+                onClicked: { root.playClicked(); Nav.play(root.titleInfo.path) }
             }
             NfButton {
                 objectName: "billboardMoreInfo"
                 text: "More Info"; iconName: "info"; primary: false
                 fontSize: Math.round(Math.max(14, root.vw * 1.2))
-                onClicked: { root.moreInfoClicked(); Nav.openDetail(root.title.id) }
+                onClicked: { root.moreInfoClicked(); Nav.openDetail(root.titleInfo.titleId) }
             }
         }
     }
@@ -336,7 +335,7 @@ Item {
                 id: ratingText
                 x: 3 + Math.round(root.vw * 0.8)
                 anchors.verticalCenter: parent.verticalCenter
-                text: root.hasTitle ? (root.title.rating || "") : ""
+                text: root.titleInfo.rating
                 color: "white"
                 font.family: Theme.font
                 font.pixelSize: parent.fs

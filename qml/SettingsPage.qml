@@ -271,20 +271,4 @@ FocusScope {
         Text { id: bt; anchors.centerIn: parent; text: b.label; color: "white"; font.family: Theme.font; font.pixelSize: page.fs; font.weight: Font.DemiBold }
         MouseArea { id: bma; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; enabled: b.enabled; onClicked: b.clicked() }
     }
-    component Spinner: Item {
-        id: sp
-        property real size: 24
-        width: size; height: size
-        Rectangle {
-            anchors.fill: parent; radius: width / 2
-            color: "transparent"; border.width: 2.5; border.color: "#333333"
-        }
-        Rectangle {
-            width: sp.size * 0.5; height: sp.size * 0.5
-            color: "transparent"
-            clip: true
-            Rectangle { width: sp.size; height: sp.size; radius: sp.size / 2; color: "transparent"; border.width: 2.5; border.color: "#E50914" }
-        }
-        RotationAnimation on rotation { from: 0; to: 360; duration: 900; loops: Animation.Infinite; running: sp.visible }
-    }
 }

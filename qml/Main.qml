@@ -21,9 +21,13 @@ ApplicationWindow {
         visible: win.browsing && Nav.playerPath === ""
         enabled: visible
 
+        // While the intro / profile gate is up, the home page is built in the background (asynchronous incubation,
+        // so the intro animation never stalls); if it is still incubating when browsing starts, switching to
+        // synchronous finishes it at once, so there is no blank frame. Page switches while browsing stay synchronous.
         Loader {
             id: pageLoader
             anchors.fill: parent
+            asynchronous: !win.browsing
             sourceComponent: {
                 switch (Nav.page) {
                 case "home":     return homeComp
@@ -36,7 +40,11 @@ ApplicationWindow {
                 default:         return homeComp
                 }
             }
-            onLoaded: (item as Item).forceActiveFocus()
+            onLoaded: if (win.browsing) (item as Item).forceActiveFocus()
+        }
+        Connections {
+            target: win
+            function onBrowsingChanged() { if (win.browsing && pageLoader.item) (pageLoader.item as Item).forceActiveFocus() }
         }
 
         Component { id: homeComp;     HomePage {} }
