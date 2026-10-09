@@ -1,4 +1,5 @@
 #include "playerpgs.h"
+#include "playertrickplay.h" // setBackgroundPriority()
 
 #include <QCryptographicHash>
 #include <QDir>
@@ -7,7 +8,10 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QPainter>
+#include <QQuickWindow>
+#include <QSGImageNode>
+#include <QSGTexture>
+#include <QTimer>
 #include <QProcess>
 #include <QStandardPaths>
 #include <QtConcurrent/QtConcurrentRun>
@@ -59,15 +63,32 @@ struct PendingComposition {
 
 // ------------------------------------------------------------------------------------------ parsing
 
-QVector<PgsCue> PgsSubtitles::parseSup(const QByteArray &data)
+// Incremental .sup parser: feed() takes the stream in arbitrary chunks (a file that is still being written)
+// and keeps an incomplete trailing segment for the next call.
+class PgsParser
 {
-    QVector<PgsCue> sets; // every display set, including the ones that clear the screen
-    QHash<int, QVector<QRgb>> palettes;
-    QHash<int, ObjectData> objects;
-    PendingComposition pcs;
+public:
+    void feed(const QByteArray &chunk);
+    QVector<PgsCue> cues() const;
 
-    const uchar *base = reinterpret_cast<const uchar *>(data.constData());
-    const qsizetype n = data.size();
+private:
+    QByteArray m_buf;          // unparsed tail (an incomplete segment)
+    QVector<PgsCue> m_sets;    // every display set, including the ones that clear the screen
+    QHash<int, QVector<QRgb>> m_palettes;
+    QHash<int, ObjectData> m_objects;
+    PendingComposition m_pcs;
+};
+
+void PgsParser::feed(const QByteArray &chunk)
+{
+    m_buf.append(chunk);
+    QVector<PgsCue> &sets = m_sets;
+    QHash<int, QVector<QRgb>> &palettes = m_palettes;
+    QHash<int, ObjectData> &objects = m_objects;
+    PendingComposition &pcs = m_pcs;
+
+    const uchar *base = reinterpret_cast<const uchar *>(m_buf.constData());
+    const qsizetype n = m_buf.size();
     qsizetype off = 0;
     while (off + 13 <= n) {
         if (base[off] != 'P' || base[off + 1] != 'G') { // resync on garbage
@@ -183,7 +204,12 @@ QVector<PgsCue> PgsSubtitles::parseSup(const QByteArray &data)
             break;
         }
     }
+    m_buf.remove(0, off);
+}
 
+QVector<PgsCue> PgsParser::cues() const
+{
+    QVector<PgsCue> sets = m_sets;
     std::stable_sort(sets.begin(), sets.end(), [](const PgsCue &a, const PgsCue &b) { return a.startMs < b.startMs; });
     QVector<PgsCue> cues;
     for (int i = 0; i < sets.size(); ++i) {
@@ -196,6 +222,13 @@ QVector<PgsCue> PgsSubtitles::parseSup(const QByteArray &data)
         cues.append(std::move(c));
     }
     return cues;
+}
+
+QVector<PgsCue> PgsSubtitles::parseSup(const QByteArray &data)
+{
+    PgsParser p;
+    p.feed(data);
+    return p.cues();
 }
 
 QImage PgsSubtitles::decodeObject(const PgsObject &obj, const QVector<QRgb> &palette)
@@ -250,12 +283,15 @@ QImage PgsSubtitles::decodeObject(const PgsObject &obj, const QVector<QRgb> &pal
     return img;
 }
 
+
 // ------------------------------------------------------------------------------------------ item
 
-PgsSubtitles::PgsSubtitles(QQuickItem *parent) : QQuickPaintedItem(parent)
+PgsSubtitles::PgsSubtitles(QQuickItem *parent) : QQuickItem(parent)
 {
-    setAntialiasing(true);
     setFlag(ItemHasContents, true);
+    m_poll = new QTimer(this);
+    m_poll->setInterval(500);
+    connect(m_poll, &QTimer::timeout, this, &PgsSubtitles::parseMore);
 }
 
 PgsSubtitles::~PgsSubtitles()
@@ -263,17 +299,50 @@ PgsSubtitles::~PgsSubtitles()
     stopProcesses();
 }
 
+// Kills the helpers without waiting for them: each one deletes itself (and the .part files it was
+// writing) once it has exited.
 void PgsSubtitles::stopProcesses()
 {
+    m_poll->stop();
+    QStringList parts;
+    for (const QString &path : std::as_const(m_extracting))
+        parts << path + QStringLiteral(".part");
+    m_extracting.clear();
     for (QPointer<QProcess> *pp : {&m_probe, &m_extract}) {
         if (QProcess *proc = pp->data()) {
+            const QStringList tmp = pp == &m_extract ? parts : QStringList();
+            auto cleanUp = [proc, tmp]() {
+                for (const QString &t : tmp)
+                    QFile::remove(t);
+                proc->deleteLater();
+            };
             proc->disconnect(this);
-            proc->kill();
-            proc->waitForFinished(500);
-            proc->deleteLater();
+            proc->setParent(nullptr); // outlives this item until it is gone
+            if (proc->state() == QProcess::NotRunning) {
+                cleanUp();
+            } else {
+                connect(proc, &QProcess::finished, proc, cleanUp);
+                proc->kill();
+            }
         }
         *pp = nullptr;
     }
+}
+
+void PgsSubtitles::resetCues()
+{
+    m_poll->stop();
+    m_parser.reset();
+    m_parsePath.clear();
+    m_parseOffset = 0;
+    m_parseAgain = false;
+    m_cues.clear();
+    m_current = -1;
+    m_currentStart = -1;
+    m_images.clear();
+    m_imagesDirty = true;
+    m_loading = false;
+    update();
 }
 
 void PgsSubtitles::setFile(const QString &f)
@@ -285,17 +354,11 @@ void PgsSubtitles::setFile(const QString &f)
     stopProcesses();
     m_streams.clear();
     m_streamsKnown = false;
-    m_cues.clear();
-    m_current = -1;
-    m_images.clear();
-    m_loading = false;
+    resetCues();
     emit fileChanged();
     emit streamsChanged();
     emit stateChanged();
-    update();
-    probe();
-    if (m_stream >= 0)
-        load();
+    probe(); // load() follows once the streams are known
 }
 
 void PgsSubtitles::setStream(int s)
@@ -306,19 +369,9 @@ void PgsSubtitles::setStream(int s)
         return;
     m_stream = s;
     ++m_gen;
-    if (m_extract) {
-        m_extract->disconnect(this);
-        m_extract->kill();
-        m_extract->deleteLater();
-        m_extract = nullptr;
-    }
-    m_cues.clear();
-    m_current = -1;
-    m_images.clear();
-    m_loading = false;
+    resetCues(); // a running extraction pass keeps going: it writes every PGS stream of the file
     emit streamChanged();
     emit stateChanged();
-    update();
     load();
 }
 
@@ -337,7 +390,8 @@ void PgsSubtitles::setVideoRect(const QRectF &r)
         return;
     m_videoRect = r;
     emit videoRectChanged();
-    update();
+    if (!m_images.isEmpty())
+        update();
 }
 
 void PgsSubtitles::setLift(qreal l)
@@ -346,7 +400,15 @@ void PgsSubtitles::setLift(qreal l)
         return;
     m_lift = l;
     emit liftChanged();
-    update();
+    if (!m_images.isEmpty())
+        update();
+}
+
+void PgsSubtitles::geometryChange(const QRectF &newGeometry, const QRectF &oldGeometry)
+{
+    QQuickItem::geometryChange(newGeometry, oldGeometry);
+    if (!m_images.isEmpty())
+        update();
 }
 
 bool PgsSubtitles::isPgs(int ordinal) const
@@ -362,14 +424,12 @@ void PgsSubtitles::probe()
         return;
     auto *proc = new QProcess(this);
     m_probe = proc;
-    const quint64 gen = m_gen;
-    connect(proc, &QProcess::finished, this, [this, proc, gen](int code, QProcess::ExitStatus status) {
+    // stopProcesses() disconnects us on a file change, so whatever arrives here belongs to m_file
+    auto done = [this, proc](bool ok) {
         proc->deleteLater();
-        if (gen != m_gen)
-            return;
         m_probe = nullptr;
         QVariantList list;
-        if (status == QProcess::NormalExit && code == 0) {
+        if (ok) {
             const QJsonArray arr = QJsonDocument::fromJson(proc->readAllStandardOutput()).object()
                                        .value(QStringLiteral("streams")).toArray();
             for (const QJsonValue &v : arr) {
@@ -387,6 +447,15 @@ void PgsSubtitles::probe()
         m_streams = list;
         m_streamsKnown = true;
         emit streamsChanged();
+        if (m_stream >= 0 && !m_parser)
+            load();
+    };
+    connect(proc, &QProcess::finished, this, [done](int code, QProcess::ExitStatus status) {
+        done(status == QProcess::NormalExit && code == 0);
+    });
+    connect(proc, &QProcess::errorOccurred, this, [done](QProcess::ProcessError e) {
+        if (e == QProcess::FailedToStart)
+            done(false);
     });
     proc->start(QStringLiteral("ffprobe"),
                 {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-select_streams"), QStringLiteral("s"),
@@ -407,66 +476,139 @@ QString PgsSubtitles::cachePathFor(int ordinal) const
 
 void PgsSubtitles::load()
 {
-    if (m_file.isEmpty() || m_stream < 0)
+    if (m_file.isEmpty() || m_stream < 0 || !m_streamsKnown || !isPgs(m_stream))
         return;
-    const quint64 gen = m_gen;
     const QString path = cachePathFor(m_stream);
+    if (!m_extracting.contains(m_stream) && QFileInfo(path).size() <= 0) {
+        // first time for this file: copy out every PGS stream that is not cached yet, in one pass
+        QList<int> missing;
+        for (int i = 0; i < m_streams.size(); ++i)
+            if (isPgs(i) && (i == m_stream || QFileInfo(cachePathFor(i)).size() <= 0))
+                missing << i;
+        extract(missing);
+        if (!m_extracting.contains(m_stream))
+            return;
+    }
+    m_parser = std::make_shared<PgsParser>();
+    m_parseOffset = 0;
     m_loading = true;
     emit stateChanged();
-
-    auto parseFile = [this, gen](const QString &supPath) {
-        auto *watcher = new QFutureWatcher<QVector<PgsCue>>(this);
-        connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher, gen]() {
-            watcher->deleteLater();
-            setCues(watcher->result(), gen);
-        });
-        watcher->setFuture(QtConcurrent::run([supPath]() {
-            QFile f(supPath);
-            if (!f.open(QIODevice::ReadOnly))
-                return QVector<PgsCue>();
-            return parseSup(f.readAll());
-        }));
-    };
-
-    if (QFileInfo(path).size() > 0) {
-        parseFile(path);
-        return;
+    if (m_extracting.contains(m_stream)) {
+        m_parsePath = path + QStringLiteral(".part"); // still being written: follow it
+        m_poll->start();
+    } else {
+        m_parsePath = path;
     }
-    const QString tmp = path + QStringLiteral(".part");
-    auto *proc = new QProcess(this);
-    m_extract = proc;
-    connect(proc, &QProcess::finished, this, [this, proc, gen, path, tmp, parseFile](int code, QProcess::ExitStatus st) {
-        proc->deleteLater();
-        if (gen != m_gen) {
-            QFile::remove(tmp);
-            return;
-        }
-        m_extract = nullptr;
-        if (st != QProcess::NormalExit || code != 0 || QFileInfo(tmp).size() <= 0) {
-            qWarning("PGS: could not extract subtitle stream: %s", proc->readAllStandardError().constData());
-            QFile::remove(tmp);
-            m_loading = false;
-            emit stateChanged();
-            return;
-        }
-        QFile::remove(path);
-        QFile::rename(tmp, path);
-        parseFile(path);
-    });
-    proc->start(QStringLiteral("ffmpeg"),
-                {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-nostdin"), QStringLiteral("-y"),
-                 QStringLiteral("-i"), m_file, QStringLiteral("-map"), QStringLiteral("0:s:%1").arg(m_stream),
-                 QStringLiteral("-c"), QStringLiteral("copy"), QStringLiteral("-f"), QStringLiteral("sup"), tmp});
+    parseMore();
 }
 
-void PgsSubtitles::setCues(QVector<PgsCue> cues, quint64 gen)
+void PgsSubtitles::extract(const QList<int> &ordinals)
 {
-    if (gen != m_gen)
+    if (ordinals.isEmpty() || m_extract)
         return;
+    QStringList args {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-nostdin"), QStringLiteral("-y"),
+                      QStringLiteral("-i"), m_file};
+    QHash<int, QString> targets;
+    for (int ordinal : ordinals) {
+        const QString path = cachePathFor(ordinal);
+        targets.insert(ordinal, path);
+        args << QStringLiteral("-map") << QStringLiteral("0:s:%1").arg(ordinal) << QStringLiteral("-c")
+             << QStringLiteral("copy") << QStringLiteral("-f") << QStringLiteral("sup") << path + QStringLiteral(".part");
+    }
+    auto *proc = new QProcess(this);
+    setBackgroundPriority(proc);
+    m_extract = proc;
+    m_extracting = targets;
+    // stopProcesses() disconnects us on a file change, so whatever arrives here belongs to m_file
+    auto done = [this, proc, targets](bool ok) {
+        proc->deleteLater();
+        m_extract = nullptr;
+        m_extracting.clear();
+        if (!ok)
+            qWarning("PGS: could not extract subtitle streams: %s", proc->readAllStandardError().constData());
+        for (auto it = targets.cbegin(); it != targets.cend(); ++it) {
+            const QString part = it.value() + QStringLiteral(".part");
+            if (ok && QFileInfo(part).size() > 0) {
+                QFile::remove(it.value());
+                QFile::rename(part, it.value());
+            } else {
+                QFile::remove(part);
+            }
+        }
+        if (!m_parser || !targets.contains(m_stream))
+            return;
+        m_poll->stop();
+        if (ok && QFileInfo(targets.value(m_stream)).size() > 0) {
+            m_parsePath = targets.value(m_stream); // same bytes: the parse continues at m_parseOffset
+            parseMore();
+        } else {
+            m_parsePath.clear();
+            m_loading = false;
+            emit stateChanged();
+        }
+    };
+    connect(proc, &QProcess::finished, this, [done](int code, QProcess::ExitStatus st) {
+        done(st == QProcess::NormalExit && code == 0);
+    });
+    connect(proc, &QProcess::errorOccurred, this, [done](QProcess::ProcessError e) {
+        if (e == QProcess::FailedToStart)
+            done(false);
+    });
+    proc->start(QStringLiteral("ffmpeg"), args);
+}
+
+// Feeds whatever was appended to m_parsePath since the last call to the selected stream's parser, on a
+// worker thread (one task at a time; a request while one runs is queued).
+void PgsSubtitles::parseMore()
+{
+    if (m_parseBusy) {
+        m_parseAgain = true;
+        return;
+    }
+    m_parseAgain = false;
+    if (!m_parser || m_parsePath.isEmpty())
+        return;
+    struct Result { qint64 offset; QVector<PgsCue> cues; bool grew; };
+    const std::shared_ptr<PgsParser> parser = m_parser;
+    const QString path = m_parsePath;
+    const qint64 offset = m_parseOffset;
+    const quint64 gen = m_gen;
+    m_parseBusy = true;
+    auto *watcher = new QFutureWatcher<Result>(this);
+    connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher, gen, path]() {
+        watcher->deleteLater();
+        m_parseBusy = false;
+        if (gen == m_gen) {
+            Result r = watcher->result();
+            m_parseOffset = r.offset;
+            if (r.grew)
+                setCues(std::move(r.cues));
+            if (!m_parseAgain && path == m_parsePath && !path.endsWith(QLatin1String(".part"))) {
+                m_loading = false; // the complete stream is in
+                emit stateChanged();
+            }
+        }
+        if (m_parseAgain)
+            parseMore();
+    });
+    watcher->setFuture(QtConcurrent::run([parser, path, offset]() {
+        Result r {offset, {}, false};
+        QFile f(path);
+        if (!f.open(QIODevice::ReadOnly) || f.size() <= offset || !f.seek(offset))
+            return r;
+        const QByteArray data = f.readAll();
+        parser->feed(data);
+        r.offset = offset + data.size();
+        r.cues = parser->cues();
+        r.grew = true;
+        return r;
+    }));
+}
+
+void PgsSubtitles::setCues(QVector<PgsCue> cues)
+{
     m_cues = std::move(cues);
-    m_loading = false;
-    m_current = -1;
-    m_images.clear();
+    m_current = -1; // re-resolved below; the decoded images stay when it is still the same cue
     emit stateChanged();
     updateCurrent();
 }
@@ -487,30 +629,61 @@ void PgsSubtitles::updateCurrent()
     if (idx == m_current)
         return;
     m_current = idx;
+    const qint64 start = idx >= 0 ? m_cues.at(idx).startMs : -1;
+    if (start == m_currentStart)
+        return; // the same cue in a re-parsed list
+    m_currentStart = start;
     m_images.clear();
     if (idx >= 0) {
         const PgsCue &c = m_cues.at(idx);
+        m_canvas = QSize(c.canvasWidth, c.canvasHeight);
         for (const PgsObject &o : c.objects) {
             const QImage img = decodeObject(o, c.palette);
             if (!img.isNull())
                 m_images.append({QRect(QPoint(o.x, o.y), img.size()), img});
         }
     }
+    m_imagesDirty = true;
     update();
 }
 
-void PgsSubtitles::paint(QPainter *p)
+QSGNode *PgsSubtitles::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
 {
-    if (m_current < 0 || m_images.isEmpty())
-        return;
-    const PgsCue &c = m_cues.at(m_current);
+    // A plain container with one textured quad per object of the current cue, each texture the size of
+    // its object; the container stays empty (draws nothing) while no cue is shown.
+    QSGNode *root = oldNode;
+    if (m_imagesDirty) {
+        m_imagesDirty = false;
+        if (root) {
+            while (QSGNode *child = root->firstChild()) {
+                root->removeChildNode(child);
+                delete child; // owns its texture
+            }
+        }
+        if (!m_images.isEmpty()) {
+            if (!root)
+                root = new QSGNode;
+            for (const auto &it : std::as_const(m_images)) {
+                QSGImageNode *node = window()->createImageNode();
+                QSGTexture *tex = window()->createTextureFromImage(it.second);
+                node->setTexture(tex);
+                node->setOwnsTexture(true);
+                node->setFiltering(QSGTexture::Linear);
+                node->setSourceRect(QRectF(QPointF(0, 0), tex->textureSize()));
+                root->appendChildNode(node);
+            }
+        }
+    }
+    if (!root || m_images.isEmpty() || m_canvas.isEmpty())
+        return root;
+
     const QRectF vr = m_videoRect.isEmpty() ? boundingRect() : m_videoRect;
     // Fit the canvas to the video width, centred on the video (letterboxed films keep their subtitles in
     // the bars, as on a Blu-ray player); shrink if the window is too short for it.
-    qreal s = vr.width() / c.canvasWidth;
-    if (c.canvasHeight * s > height())
-        s = height() / c.canvasHeight;
-    const QSizeF cs(c.canvasWidth * s, c.canvasHeight * s);
+    qreal s = vr.width() / m_canvas.width();
+    if (m_canvas.height() * s > height())
+        s = height() / m_canvas.height();
+    const QSizeF cs(m_canvas.width() * s, m_canvas.height() * s);
     QPointF origin(vr.center().x() - cs.width() / 2, vr.center().y() - cs.height() / 2);
     origin.setY(std::clamp(origin.y(), 0.0, std::max(0.0, height() - cs.height())));
 
@@ -523,9 +696,11 @@ void PgsSubtitles::paint(QPainter *p)
     if (bounds.top() + dy < 0)
         dy = -bounds.top();
 
-    p->setRenderHint(QPainter::SmoothPixmapTransform, true);
-    for (const auto &it : std::as_const(m_images)) {
-        const QRectF target(origin + QPointF(it.first.x() * s, it.first.y() * s + dy), QSizeF(it.first.size()) * s);
-        p->drawImage(target, it.second);
+    int i = 0;
+    for (QSGNode *child = root->firstChild(); child && i < m_images.size(); child = child->nextSibling(), ++i) {
+        const QRect &r = m_images.at(i).first;
+        static_cast<QSGImageNode *>(child)->setRect(
+            QRectF(origin + QPointF(r.x() * s, r.y() * s + dy), QSizeF(r.size()) * s));
     }
+    return root;
 }
