@@ -3,7 +3,6 @@
 #include <QQuickStyle>
 #include <QFontDatabase>
 #include <QIcon>
-#include <QSurfaceFormat>
 #include <QQuickWindow>
 #include <QTimer>
 
@@ -20,10 +19,6 @@ int main(int argc, char *argv[])
     QGuiApplication::setDesktopFileName("qtflix"); // matches packaging/qtflix.desktop (taskbar icon on Wayland)
     QGuiApplication::setWindowIcon(QIcon(":/assets/mark.svg"));
     QQuickStyle::setStyle("Basic");
-
-    QSurfaceFormat fmt = QSurfaceFormat::defaultFormat();
-    fmt.setSamples(4);
-    QSurfaceFormat::setDefaultFormat(fmt);
 
     Library library(nullptr);
     Tmdb tmdb(&library);                            // declared before the engine so it outlives QML
