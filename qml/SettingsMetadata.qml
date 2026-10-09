@@ -162,6 +162,8 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
                 visible: Tmdb.busy
                 size: Math.round(root.fs * 1.1)
+                lineWidth: 2
+                trackColor: "#404040"
             }
             Text {
                 anchors.verticalCenter: parent.verticalCenter
@@ -450,17 +452,5 @@ Item {
                    : (hov ? Qt.rgba(109/255, 109/255, 110/255, 0.4) : Qt.rgba(109/255, 109/255, 110/255, 0.7))
         Text { id: bt; anchors.centerIn: parent; text: b.label; color: "white"; font.family: Theme.font; font.pixelSize: root.fs; font.weight: Font.DemiBold }
         MouseArea { id: bma; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; enabled: b.enabled; onClicked: b.clicked() }
-    }
-    component Spinner: Item {
-        id: sp
-        property real size: 18
-        width: size; height: size
-        Rectangle { anchors.fill: parent; radius: width / 2; color: "transparent"; border.width: 2; border.color: "#404040" }
-        Item {
-            width: sp.size / 2; height: sp.size / 2
-            clip: true
-            Rectangle { width: sp.size; height: sp.size; radius: sp.size / 2; color: "transparent"; border.width: 2; border.color: Theme.red }
-        }
-        RotationAnimation on rotation { from: 0; to: 360; duration: 900; loops: Animation.Infinite; running: sp.visible }
     }
 }
