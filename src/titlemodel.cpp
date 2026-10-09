@@ -52,9 +52,27 @@ QHash<int, QByteArray> TitleModel::roleNames() const
         {RankRole, "rank"},
         {LogoImageRole, "logoImage"},
         {HasMetaRole, "hasMeta"},
+        {IsRecentRole, "isRecent"},
     };
     return names;
 }
+
+namespace {
+// Fenwick tree over 0/1 flags: how many of the first k old rows are still waiting to be placed.
+struct Fenwick {
+    QVector<int> t;
+    explicit Fenwick(int n) : t(n + 1, 0)
+    {
+        for (int i = 1; i <= n; ++i) { // all ones, built in O(n)
+            t[i] += 1;
+            const int j = i + (i & -i);
+            if (j <= n) t[j] += t[i];
+        }
+    }
+    void clear(int k) { for (int i = k + 1; i < t.size(); i += i & -i) --t[i]; }
+    int prefix(int k) const { int s = 0; for (int i = k; i > 0; i -= i & -i) s += t[i]; return s; } // flags [0, k)
+};
+} // namespace
 
 // Applies the new id list as row removals / moves / insertions instead of a model reset, so views keep
 // their delegates and scroll positions during background rescans (identical lists are a no-op).
@@ -86,26 +104,31 @@ void TitleModel::setIds(const QStringList &ids)
             endRemoveRows();
             i = first;
         }
-        // 2) walk the target order: move rows that exist further down, insert new ones
-        QSet<QString> present(m_ids.cbegin(), m_ids.cend());
+        // 2) walk the target order: move rows that exist further down, insert new ones. Rows [0, i) are final;
+        //    the old rows not placed yet follow in their old relative order, so an old row's current position is
+        //    i + (number of unplaced old rows before it) -- a Fenwick query instead of an indexOf() per move.
+        QHash<QString, int> oldIndex;
+        oldIndex.reserve(m_ids.size());
+        for (int k = 0; k < m_ids.size(); ++k)
+            oldIndex.insert(m_ids.at(k), k);
+        Fenwick waiting(int(m_ids.size()));
         for (int i = 0; i < ids.size(); ++i) {
-            const QString &id = ids.at(i);
-            if (i < m_ids.size() && m_ids.at(i) == id)
-                continue;
-            if (present.contains(id)) {
-                const int j = int(m_ids.indexOf(id, i + 1));
+            const auto old = oldIndex.constFind(ids.at(i));
+            if (old != oldIndex.cend()) {
+                const int j = i + waiting.prefix(old.value());
+                waiting.clear(old.value());
+                if (j == i)
+                    continue;
                 beginMoveRows(QModelIndex(), j, j, QModelIndex(), i);
                 m_ids.move(j, i);
                 endMoveRows();
             } else {
                 int last = i; // insert a run of new ids in one go
-                while (last + 1 < ids.size() && !present.contains(ids.at(last + 1)))
+                while (last + 1 < ids.size() && !oldIndex.contains(ids.at(last + 1)))
                     ++last;
                 beginInsertRows(QModelIndex(), i, last);
-                for (int k = i; k <= last; ++k) {
+                for (int k = i; k <= last; ++k)
                     m_ids.insert(k, ids.at(k));
-                    present.insert(ids.at(k));
-                }
                 endInsertRows();
                 i = last;
             }
@@ -117,27 +140,48 @@ void TitleModel::setIds(const QStringList &ids)
             endResetModel();
         }
     }
+    reindex();
     if (!m_ids.isEmpty()) // RankRole is positional
         emit dataChanged(index(0), index(int(m_ids.size()) - 1), {RankRole});
     if (oldCount != m_ids.size())
         emit countChanged();
 }
 
-void TitleModel::refresh(const QString &id)
+void TitleModel::reindex()
 {
+    m_rowOf.clear();
+    m_rowOf.reserve(m_ids.size());
+    for (int i = 0; i < m_ids.size(); ++i)
+        m_rowOf.insert(m_ids.at(i), i);
+    if (m_rowOf.size() != m_ids.size())
+        m_rowOf.clear(); // duplicates: refresh() falls back to a linear search
+}
+
+void TitleModel::refresh(const QString &id, const QList<int> &roles)
+{
+    if (m_ids.isEmpty())
+        return;
+    if (!m_rowOf.isEmpty()) {
+        const auto it = m_rowOf.constFind(id);
+        if (it != m_rowOf.cend()) {
+            const QModelIndex idx = index(it.value());
+            emit dataChanged(idx, idx, roles);
+        }
+        return;
+    }
     for (int i = 0; i < m_ids.size(); ++i) {
         if (m_ids.at(i) == id) {
             const QModelIndex idx = index(i);
-            emit dataChanged(idx, idx);
+            emit dataChanged(idx, idx, roles);
         }
     }
 }
 
-void TitleModel::refreshAll()
+void TitleModel::refreshAll(const QList<int> &roles)
 {
     if (m_ids.isEmpty())
         return;
-    emit dataChanged(index(0), index(int(m_ids.size()) - 1));
+    emit dataChanged(index(0), index(int(m_ids.size()) - 1), roles);
 }
 
 QVariantMap TitleModel::get(int row) const

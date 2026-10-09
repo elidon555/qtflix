@@ -1,9 +1,13 @@
 #pragma once
 #include <QAbstractListModel>
 #include <qqml.h>
+#include <QCollator>
 #include <QDateTime>
+#include <QHash>
 #include <QStringList>
+#include <QUrl>
 #include <QVector>
+#include <optional>
 
 // One playable file (a movie, or one episode of a series).
 struct MediaFile {
@@ -16,6 +20,7 @@ struct MediaFile {
     int height = 0;
     QString videoCodec;    // e.g. "hevc"
     QDateTime modified;
+    bool probed = true;    // false while a first scan shows the file before ffprobe ran (durationMs etc. unknown)
 };
 
 // One card on the UI: a movie, or a whole series (grouped episodes).
@@ -35,6 +40,14 @@ struct Title {
     bool hasExternalMeta = false; // true once setExternalMetadata() was applied
     QDateTime added;       // newest file mtime
     QVector<MediaFile> files; // movies: exactly 1; series: all episodes sorted by (season, episode)
+
+    // --- derived values, filled by Library::prepare() on the GUI thread whenever a title is (re)applied.
+    //     Not persisted and not part of the change detection (they follow from the fields above).
+    int seasonCount = 0;   // SeasonCountRole
+    QString quality;       // QualityRole
+    qint64 totalMs = 0;    // sum of all file durations (Top 10 order)
+    QUrl cardUrl, backdropUrl, logoUrl;
+    std::optional<QCollatorSortKey> sortKey; // alphabetical order ("The " ignored, numeric aware)
 };
 
 class Library;
@@ -43,7 +56,7 @@ class TitleModel : public QAbstractListModel
 {
     Q_OBJECT
     QML_ANONYMOUS
-    Q_PROPERTY(int count READ rowCount NOTIFY countChanged)
+    Q_PROPERTY(int count READ rowCount NOTIFY countChanged FINAL)
 public:
     enum Roles {
         IdRole = Qt::UserRole + 1,
@@ -69,7 +82,8 @@ public:
         MatchRole,         // int
         RankRole,          // int 1-based row index (used by Top 10 row)
         LogoImageRole,     // QUrl file:// of Title::logoFile, or empty QUrl when none
-        HasMetaRole        // bool Title::hasExternalMeta
+        HasMetaRole,       // bool Title::hasExternalMeta
+        IsRecentRole       // bool: `added` is less than 7 days ago (same rule as Theme.isRecent)
     };
     Q_ENUM(Roles)
 
@@ -82,9 +96,9 @@ public:
     // Replace contents with these title ids (looked up in the Library).
     void setIds(const QStringList &ids);
     QStringList ids() const { return m_ids; }
-    // Re-emit dataChanged for a title (progress / my list changed).
-    void refresh(const QString &id);
-    void refreshAll();
+    // Re-emit dataChanged for a title (progress / my list changed). Empty roles = all roles.
+    void refresh(const QString &id, const QList<int> &roles = {});
+    void refreshAll(const QList<int> &roles = {});
 
     Q_INVOKABLE QVariantMap get(int row) const; // all roles as a map, keys == roleNames
 
@@ -94,6 +108,8 @@ signals:
 private:
     Library *m_lib;
     QStringList m_ids;
+    QHash<QString, int> m_rowOf;  // id -> row (rebuilt by setIds; empty when m_ids holds duplicates)
+    void reindex();
 };
 
 // Row of the home page.
