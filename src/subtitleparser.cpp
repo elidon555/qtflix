@@ -2,6 +2,8 @@
 
 #include <QFile>
 #include <QFileInfo>
+#include <QFutureWatcher>
+#include <QtConcurrent/QtConcurrentRun>
 #include <QRegularExpression>
 #include <QStringDecoder>
 #include <QStringList>
@@ -390,6 +392,28 @@ QVector<SubtitleTrack::Cue> flatten(QVector<SubtitleTrack::Cue> cues)
     return out;
 }
 
+// Reads and parses a subtitle file (runs on a worker thread).
+QVector<SubtitleTrack::Cue> loadFile(const QString &path)
+{
+    QFile f(path);
+    if (f.size() >= 64 * 1024 * 1024 || !f.open(QIODevice::ReadOnly)) {
+        qWarning("SubtitleTrack: cannot open %s", qPrintable(path));
+        return {};
+    }
+    QString content = decode(f.readAll());
+    content.replace(QLatin1String("\r\n"), QLatin1String("\n"));
+    const QString ext = QFileInfo(path).suffix().toLower();
+    const QString head = content.left(512).trimmed();
+    Format fmt = Format::Srt;
+    if (ext == u"vtt" || head.startsWith(QLatin1String("WEBVTT")))
+        fmt = Format::Vtt;
+    else if (ext == u"ass" || ext == u"ssa" || head.startsWith(QLatin1String("[Script Info]"), Qt::CaseInsensitive))
+        fmt = Format::Ass;
+    QVector<SubtitleTrack::Cue> cues = fmt == Format::Ass ? parseAss(content)
+                                                          : parseSrtVtt(content, fmt == Format::Vtt);
+    return flatten(std::move(cues));
+}
+
 } // namespace
 
 // ----------------------------------------------------------------------------------------------
@@ -401,6 +425,8 @@ void SubtitleTrack::setSource(const QUrl &u)
     if (u == m_source)
         return;
     m_source = u;
+    const quint64 gen = ++m_gen;
+    const bool hadCues = !m_cues.isEmpty();
     m_cues.clear();
     m_lastIdx = 0;
 
@@ -410,27 +436,25 @@ void SubtitleTrack::setSource(const QUrl &u)
     else if (u.scheme() == u"qrc") path = u':' + u.path();
 
     if (!path.isEmpty()) {
-        QFile f(path);
-        if (f.size() < 64 * 1024 * 1024 && f.open(QIODevice::ReadOnly)) {
-            QString content = decode(f.readAll());
-            content.replace(QLatin1String("\r\n"), QLatin1String("\n"));
-            const QString ext = QFileInfo(path).suffix().toLower();
-            const QString head = content.left(512).trimmed();
-            Format fmt = Format::Srt;
-            if (ext == u"vtt" || head.startsWith(QLatin1String("WEBVTT")))
-                fmt = Format::Vtt;
-            else if (ext == u"ass" || ext == u"ssa" || head.startsWith(QLatin1String("[Script Info]"), Qt::CaseInsensitive))
-                fmt = Format::Ass;
-            QVector<Cue> cues = fmt == Format::Ass ? parseAss(content)
-                                                   : parseSrtVtt(content, fmt == Format::Vtt);
-            m_cues = flatten(std::move(cues));
-        } else {
-            qWarning("SubtitleTrack: cannot open %s", qPrintable(path));
-        }
+        // parsed off the GUI thread; a result for an older source is dropped
+        auto *watcher = new QFutureWatcher<QVector<Cue>>(this);
+        connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher, gen]() {
+            watcher->deleteLater();
+            if (gen != m_gen)
+                return;
+            m_cues = watcher->result();
+            m_lastIdx = 0;
+            emit cuesChanged();
+            update();
+        });
+        watcher->setFuture(QtConcurrent::run(loadFile, path));
     }
     emit sourceChanged();
+    if (hadCues)
+        emit cuesChanged();
     update();
 }
+
 
 void SubtitleTrack::setPositionMs(qint64 ms)
 {

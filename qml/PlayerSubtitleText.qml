@@ -11,6 +11,7 @@ Item {
     property var spec: ({})
     property real basePixelSize: 32
     property real maxWidth: 800
+    property bool active: true            // a subtitle track is selected (the shadow layer lives this long)
 
     readonly property real sizeFactor: spec.size === "small" ? 0.75 : (spec.size === "large" ? 1.35 : 1.0)
     readonly property string edge: spec.edge || "shadow"
@@ -47,7 +48,8 @@ Item {
         font.pixelSize: Math.round(st.basePixelSize * st.sizeFactor)
         font.weight: Font.DemiBold
         lineHeight: 1.1
-        layer.enabled: st.visible && st.text !== "" && st.edge === "shadow"
+        // kept for as long as a track is on, not per cue: toggling a layer rebuilds the blur effect
+        layer.enabled: st.active && st.edge === "shadow"
         layer.effect: MultiEffect {
             shadowEnabled: true
             shadowColor: "black"
