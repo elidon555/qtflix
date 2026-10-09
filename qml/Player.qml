@@ -236,10 +236,6 @@ Rectangle {
         saveProgress()
         finalized = true
     }
-    // Library.setProgress() persists lazily; write it out now (close / pause). Newer Library API: guarded.
-    function flushProgress() {
-        if (typeof Library.flushProgress === "function") Library.flushProgress()
-    }
     function markWatchedOnce() {
         if (watchedMarked || currentPath === "") return
         watchedMarked = true
@@ -250,7 +246,7 @@ Rectangle {
         if (closing) return
         closing = true
         finishCurrent()
-        flushProgress()
+        Library.flushProgress() // setProgress() persists lazily
         player.stop()
         restoreWindow()
         closed()
@@ -540,7 +536,7 @@ Rectangle {
             }
         }
         onPlaybackStateChanged: {
-            if (playbackState === MediaPlayer.PausedState) { root.saveProgress(); root.flushProgress() }
+            if (playbackState === MediaPlayer.PausedState) { root.saveProgress(); Library.flushProgress() }
             root.wake()
         }
         onErrorOccurred: function(error, errorString) {
