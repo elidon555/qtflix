@@ -37,6 +37,7 @@ Rectangle {
     property bool finalized: false            // the final progress of currentPath has been written
     property bool watchedMarked: false        // Library.markWatched() done for currentPath
     property bool tracksApplied: false        // remembered audio/subtitle choice applied for currentPath
+    property bool extrasReady: false          // sidecars / episodeList of currentPath are loaded
 
     // persisted player preferences (same QSettings file as the C++ side: player/<key>)
     Settings {
@@ -123,7 +124,7 @@ Rectangle {
     readonly property int iconSize: 32
 
     // ---- helpers ---------------------------------------------------------------------------
-    function fmt(ms) {
+    function fmt(ms: real): string {
         var s = Math.max(0, Math.floor(ms / 1000))
         var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60
         var ss = (sec < 10 ? "0" : "") + sec
@@ -156,8 +157,16 @@ Rectangle {
         if (!currentPath) return
         var i = Library.fileInfo(currentPath)
         info = i ? i : ({})
-        sidecars = Library.sidecarSubtitles(currentPath) || []
+        refreshExtras(currentPath)
+    }
+    // Sidecar subtitles (directory listings) and the season's episode list: not needed for the first
+    // frame, so load() defers them until the media source is set.
+    function refreshExtras(p) {
+        if (p !== currentPath || !currentPath) return     // a newer file took over
+        sidecars = Library.sidecarSubtitles(currentPath)
         refreshEpisodes()
+        extrasReady = true
+        if (resumeDone && !tracksApplied) applyRememberedTracks()
     }
     function refreshEpisodes() {
         episodeList = (info.isSeries && info.id) ? (Library.episodes(info.id, info.season) || []) : []
@@ -175,6 +184,9 @@ Rectangle {
         finalized = false
         watchedMarked = false
         tracksApplied = false
+        extrasReady = false
+        sidecars = []
+        episodeList = []
         openPanel = ""
         subtitleChoice = 0
         subs.source = ""
@@ -187,12 +199,14 @@ Rectangle {
             info = ({})
             return
         }
-        refreshInfo()
+        var i = Library.fileInfo(path)        // cheap lookup: url, resume point, next episode
+        info = i ? i : ({})
         resumeMs = info.positionMs || Library.position(path) || 0
         if (info.durationMs > 0 && resumeMs >= info.durationMs * 0.95) resumeMs = 0   // finished before: start over
         player.source = info.url ? info.url : fileUrl(path)
         player.playbackRate = settings.speed
         player.play()
+        Qt.callLater(refreshExtras, path)
         wake()                                // controls show the new title for a few seconds
         root.forceActiveFocus()
     }
@@ -222,6 +236,10 @@ Rectangle {
         saveProgress()
         finalized = true
     }
+    // Library.setProgress() persists lazily; write it out now (close / pause). Newer Library API: guarded.
+    function flushProgress() {
+        if (typeof Library.flushProgress === "function") Library.flushProgress()
+    }
     function markWatchedOnce() {
         if (watchedMarked || currentPath === "") return
         watchedMarked = true
@@ -232,6 +250,7 @@ Rectangle {
         if (closing) return
         closing = true
         finishCurrent()
+        flushProgress()
         player.stop()
         restoreWindow()
         closed()
@@ -424,7 +443,7 @@ Rectangle {
         return normLang(l || audioLabels[i])
     }
     function applyRememberedTracks() {
-        if (tracksApplied) return
+        if (tracksApplied || !extrasReady) return     // refreshExtras() calls again once sidecars are known
         tracksApplied = true
         // audio
         var a = parseJson(settings.lastAudio, null)
@@ -521,7 +540,7 @@ Rectangle {
             }
         }
         onPlaybackStateChanged: {
-            if (playbackState === MediaPlayer.PausedState) root.saveProgress()
+            if (playbackState === MediaPlayer.PausedState) { root.saveProgress(); root.flushProgress() }
             root.wake()
         }
         onErrorOccurred: function(error, errorString) {
@@ -603,6 +622,7 @@ Rectangle {
         Behavior on anchors.bottomMargin { NumberAnimation { duration: 250; easing.type: Easing.InOutQuad } }
         maxWidth: root.width * 0.8
         text: subs.currentText
+        active: subs.valid && !root.hasError    // a sidecar track is on: keep its shadow layer alive
         spec: root.subtitleStyle
         basePixelSize: Math.max(20, Math.round(root.height * 0.034))
     }
@@ -708,16 +728,19 @@ Rectangle {
                 font.features: { "tnum": 1 }
             }
 
-            // the clock only drives these while the controls are visible
+            // the clock only drives these while the controls are visible (the values are gated too: a
+            // Binding evaluates `value` even while `when` is false)
             Binding {
                 target: timeline; property: "position"
-                when: controls.visible; value: root.positionMs
+                when: controls.visible; value: controls.visible ? root.positionMs : 0
                 restoreMode: Binding.RestoreNone
             }
             Binding {
                 target: remaining; property: "text"
                 when: controls.visible
-                value: root.fmt(Math.max(0, root.durationMs - (timeline.dragging ? timeline.dragPos : root.positionMs)))
+                value: controls.visible
+                       ? root.fmt(Math.max(0, root.durationMs - (timeline.dragging ? timeline.dragPos : root.positionMs)))
+                       : ""
                 restoreMode: Binding.RestoreNone
             }
 
