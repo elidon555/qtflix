@@ -65,7 +65,7 @@ set(CPACK_DEBIAN_PACKAGE_SECTION video)
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "ffmpeg, fonts-inter, qml6-module-qtquick, qml6-module-qtquick-controls, \
 qml6-module-qtquick-layouts, qml6-module-qtquick-window, qml6-module-qtquick-templates, qml6-module-qtquick-effects, \
 qml6-module-qtquick-shapes, qml6-module-qtquick-dialogs, qml6-module-qtqml-workerscript, qml6-module-qtmultimedia, \
-qml6-module-qtcore, qml6-module-qt5compat-graphicaleffects, libqt6svg6")
+qml6-module-qtcore, libqt6svg6")
 include(CPack)
 
 # ---------------------------------------------------------------------------
