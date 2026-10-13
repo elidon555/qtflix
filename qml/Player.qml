@@ -189,6 +189,7 @@ Rectangle {
         episodeList = []
         openPanel = ""
         subtitleChoice = 0
+        subs.stream = -1
         subs.source = ""
         seekThrottle.stop(); seekThrottle.target = -1
         endCloseTimer.stop()
@@ -360,19 +361,24 @@ Rectangle {
         for (var i = 0; i < sidecars.length; ++i) l.push(sidecars[i].label || baseName(sidecars[i].path))
         return l
     }
+    // an embedded track drawn by Qt/PGS with the file's own style (text tracks go through `subs` and follow the app's style)
     readonly property bool embeddedSubtitleActive: subtitleChoice > 0 && subtitleChoice <= player.subtitleTracks.length
+                                                   && subs.stream < 0
 
     function chooseSubtitle(i, remember) {
         subtitleChoice = i
         var nEmb = player.subtitleTracks.length
         if (i <= 0) {
             player.activeSubtitleTrack = -1
+            subs.stream = -1
             subs.source = ""
         } else if (i <= nEmb) {
+            subs.stream = -1
             subs.source = ""
             applyEmbeddedSubtitle(i - 1)
         } else {
             player.activeSubtitleTrack = -1
+            subs.stream = -1
             subs.source = fileUrl(sidecars[i - 1 - nEmb].path)
         }
         if (i <= 0 || i > nEmb) { pendingEmbedded = -1; pgs.stream = -1 }
@@ -384,6 +390,9 @@ Rectangle {
     }
     // Image-based Blu-ray subtitles (PGS) can't be drawn by Qt Multimedia (it only logs "Invalid subtitle
     // time"), so those tracks are rendered by PgsSubtitles instead and never handed to the MediaPlayer.
+    // Embedded text tracks (ASS/SRT/...) are copied out and drawn by `subs` like a sidecar file: Qt's own
+    // renderer shows raw {\i1} override tags and loses a cue when seeking into the middle of it. Qt's
+    // renderer stays on until the extracted cues are in (and for good if the extraction fails).
     property int pendingEmbedded: -1          // embedded choice waiting for the stream probe
     function applyEmbeddedSubtitle(ordinal) {
         if (!pgs.streamsKnown) {              // probe still running: decide when it lands
@@ -399,6 +408,10 @@ Rectangle {
         } else {
             pgs.stream = -1
             player.activeSubtitleTrack = ordinal
+            if (pgs.isText(ordinal)) {
+                subs.file = currentPath
+                subs.stream = ordinal
+            }
         }
     }
     function chooseAudio(i, remember) {
@@ -560,6 +573,7 @@ Rectangle {
     SubtitleTrack {
         id: subs
         positionMs: player.position
+        onCuesChanged: if (stream >= 0 && valid) player.activeSubtitleTrack = -1   // ours took over
     }
 
     Trickplay {

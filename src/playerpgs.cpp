@@ -418,6 +418,16 @@ bool PgsSubtitles::isPgs(int ordinal) const
     return m_streams.at(ordinal).toMap().value(QStringLiteral("pgs")).toBool();
 }
 
+bool PgsSubtitles::isText(int ordinal) const
+{
+    if (ordinal < 0 || ordinal >= m_streams.size())
+        return false;
+    static const QStringList textCodecs = {QStringLiteral("ass"), QStringLiteral("ssa"), QStringLiteral("subrip"),
+                                           QStringLiteral("srt"), QStringLiteral("webvtt"), QStringLiteral("mov_text"),
+                                           QStringLiteral("text")};
+    return textCodecs.contains(m_streams.at(ordinal).toMap().value(QStringLiteral("codec")).toString());
+}
+
 void PgsSubtitles::probe()
 {
     if (m_file.isEmpty())

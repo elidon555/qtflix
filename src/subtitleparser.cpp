@@ -1,13 +1,21 @@
 #include "subtitleparser.h"
 
+#include <QCryptographicHash>
+#include <QDateTime>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QFutureWatcher>
+#include <QProcess>
+#include <QStandardPaths>
+#include <QStringConverter>
 #include <QtConcurrent/QtConcurrentRun>
 #include <QRegularExpression>
 #include <QStringDecoder>
 #include <QStringList>
 #include <algorithm>
+
+#include "playertrickplay.h" // setBackgroundPriority()
 
 // ----------------------------------------------------------------------------------------------
 // Helpers (file-local)
@@ -31,6 +39,32 @@ QString decode(QByteArray data)
     if (!utf8.hasError())
         return s;
     return QString::fromLatin1(data);
+}
+
+// Some releases carry text that was UTF-8, read as a legacy code page and saved as UTF-8 again
+// ("très" -> "trĂ¨s" / "trÃ¨s"). Undo that per line: re-encode with the code page and keep the result only
+// if every byte then forms valid UTF-8, which genuine text practically never does.
+QString repairMojibake(const QString &line)
+{
+    bool nonAscii = false;
+    for (QChar c : line)
+        if (c.unicode() > 0x7F) { nonAscii = true; break; }
+    if (!nonAscii)
+        return line;
+    static const char *const pages[] = {"Windows-1252", "Windows-1250", "Windows-1251", "ISO-8859-2"};
+    for (const char *page : pages) {
+        QStringEncoder enc(page, QStringConverter::Flag::Stateless);
+        if (!enc.isValid())
+            continue;
+        const QByteArray bytes = enc(line);
+        if (enc.hasError() || bytes.isEmpty())
+            continue;
+        QStringDecoder dec(QStringConverter::Utf8, QStringConverter::Flag::Stateless);
+        const QString fixed = dec(bytes);
+        if (!dec.hasError() && fixed != line && !fixed.contains(QChar::ReplacementCharacter))
+            return fixed;
+    }
+    return line;
 }
 
 // "01:02:03,456" | "01:02:03.456" | "02:03.456" (VTT) | "1:02:03.45" (ASS, centiseconds). -1 if invalid.
@@ -262,9 +296,9 @@ QString assText(const QString &raw)
             for (const QString &t : tags) {
                 const QString tt = t.trimmed();
                 if (tt == u"i1" && !italic) { out += QLatin1String("<i>"); italic = true; }
-                else if (tt == u"i0" && italic) { out += QLatin1String("</i>"); italic = false; }
+                else if ((tt == u"i0" || tt == u"i") && italic) { out += QLatin1String("</i>"); italic = false; }
                 else if (tt == u"b1" && !bold) { out += QLatin1String("<b>"); bold = true; }
-                else if (tt == u"b0" && bold) { out += QLatin1String("</b>"); bold = false; }
+                else if ((tt == u"b0" || tt == u"b") && bold) { out += QLatin1String("</b>"); bold = false; }
                 else if (tt.startsWith(u'p') && tt.size() >= 2 && tt[1].isDigit())
                     drawing = tt.mid(1).toInt() > 0;
                 else if (tt == u"r") {
@@ -402,6 +436,12 @@ QVector<SubtitleTrack::Cue> loadFile(const QString &path)
     }
     QString content = decode(f.readAll());
     content.replace(QLatin1String("\r\n"), QLatin1String("\n"));
+    {
+        QStringList lines = content.split(u'\n');
+        for (QString &l : lines)
+            l = repairMojibake(l);
+        content = lines.join(u'\n');
+    }
     const QString ext = QFileInfo(path).suffix().toLower();
     const QString head = content.left(512).trimmed();
     Format fmt = Format::Srt;
@@ -425,36 +465,135 @@ void SubtitleTrack::setSource(const QUrl &u)
     if (u == m_source)
         return;
     m_source = u;
+    reload();
+    emit sourceChanged();
+}
+
+void SubtitleTrack::setFile(const QString &f)
+{
+    if (f == m_file)
+        return;
+    m_file = f;
+    emit fileChanged();
+    if (m_stream >= 0)
+        reload();
+}
+
+void SubtitleTrack::setStream(int s)
+{
+    s = qMax(-1, s);
+    if (s == m_stream)
+        return;
+    m_stream = s;
+    emit streamChanged();
+    reload();
+}
+
+// (Re)starts loading whatever is selected: the embedded stream when one is set, else the source file.
+void SubtitleTrack::reload()
+{
     const quint64 gen = ++m_gen;
     const bool hadCues = !m_cues.isEmpty();
     m_cues.clear();
     m_lastIdx = 0;
+    stopExtract();
 
-    QString path;
-    if (u.isLocalFile()) path = u.toLocalFile();
-    else if (u.scheme().isEmpty()) path = u.toString();
-    else if (u.scheme() == u"qrc") path = u':' + u.path();
-
-    if (!path.isEmpty()) {
-        // parsed off the GUI thread; a result for an older source is dropped
-        auto *watcher = new QFutureWatcher<QVector<Cue>>(this);
-        connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher, gen]() {
-            watcher->deleteLater();
-            if (gen != m_gen)
-                return;
-            m_cues = watcher->result();
-            m_lastIdx = 0;
-            emit cuesChanged();
-            update();
-        });
-        watcher->setFuture(QtConcurrent::run(loadFile, path));
+    if (m_stream >= 0 && !m_file.isEmpty()) {
+        extractStream(gen);
+    } else {
+        QString path;
+        if (m_source.isLocalFile()) path = m_source.toLocalFile();
+        else if (m_source.scheme().isEmpty()) path = m_source.toString();
+        else if (m_source.scheme() == u"qrc") path = u':' + m_source.path();
+        if (!path.isEmpty())
+            loadPath(path, gen);
     }
-    emit sourceChanged();
     if (hadCues)
         emit cuesChanged();
     update();
 }
 
+// parsed off the GUI thread; a result for an older selection is dropped
+void SubtitleTrack::loadPath(const QString &path, quint64 gen)
+{
+    auto *watcher = new QFutureWatcher<QVector<Cue>>(this);
+    connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher, gen]() {
+        watcher->deleteLater();
+        if (gen != m_gen)
+            return;
+        m_cues = watcher->result();
+        m_lastIdx = 0;
+        emit cuesChanged();
+        update();
+    });
+    watcher->setFuture(QtConcurrent::run(loadFile, path));
+}
+
+QString SubtitleTrack::cachePath() const
+{
+    const QFileInfo fi(m_file);
+    const QByteArray key = (fi.absoluteFilePath() + u'|' + QString::number(fi.size()) + u'|'
+                            + QString::number(fi.lastModified().toMSecsSinceEpoch())).toUtf8();
+    const QString hash = QString::fromLatin1(QCryptographicHash::hash(key, QCryptographicHash::Sha1).toHex().left(20));
+    const QString dir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + QStringLiteral("/subs");
+    QDir().mkpath(dir);
+    return dir + u'/' + hash + u'-' + QString::number(m_stream) + QStringLiteral(".ass");
+}
+
+void SubtitleTrack::stopExtract()
+{
+    QProcess *proc = m_extract.data();
+    if (!proc)
+        return;
+    proc->disconnect(this);
+    if (proc->state() == QProcess::NotRunning) {
+        proc->deleteLater();
+    } else {
+        connect(proc, &QProcess::finished, proc, &QObject::deleteLater);
+        proc->kill();
+    }
+    m_extract.clear();
+}
+
+// Copies the stream out as ASS (ffmpeg converts subrip / webvtt / mov_text on the way), then parses it.
+void SubtitleTrack::extractStream(quint64 gen)
+{
+    const QString out = cachePath();
+    if (QFileInfo(out).size() > 0) {
+        loadPath(out, gen);
+        return;
+    }
+    const QString part = out + QStringLiteral(".part");
+    auto *proc = new QProcess(this);
+    setBackgroundPriority(proc);
+    m_extract = proc;
+    auto done = [this, proc, gen, out, part](bool ok) {
+        proc->deleteLater();
+        m_extract.clear();
+        if (!ok)
+            qWarning("SubtitleTrack: could not extract subtitle stream: %s", proc->readAllStandardError().constData());
+        if (ok && QFileInfo(part).size() > 0) {
+            QFile::remove(out);
+            QFile::rename(part, out);
+        } else {
+            QFile::remove(part);
+        }
+        if (gen == m_gen && QFileInfo(out).size() > 0)
+            loadPath(out, gen);
+    };
+    // stopExtract() disconnects us when the selection changes, so a result here belongs to the current one
+    connect(proc, &QProcess::finished, this, [done](int code, QProcess::ExitStatus st) {
+        done(st == QProcess::NormalExit && code == 0);
+    });
+    connect(proc, &QProcess::errorOccurred, this, [done](QProcess::ProcessError e) {
+        if (e == QProcess::FailedToStart)
+            done(false);
+    });
+    proc->start(QStringLiteral("ffmpeg"),
+                {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-nostdin"), QStringLiteral("-y"),
+                 QStringLiteral("-i"), m_file, QStringLiteral("-map"), QStringLiteral("0:s:%1").arg(m_stream),
+                 QStringLiteral("-c:s"), QStringLiteral("ass"), QStringLiteral("-f"), QStringLiteral("ass"), part});
+}
 
 void SubtitleTrack::setPositionMs(qint64 ms)
 {

@@ -81,6 +81,8 @@ public:
 
     // True when subtitle stream `ordinal` is PGS and this item will render it.
     Q_INVOKABLE bool isPgs(int ordinal) const;
+    // True when subtitle stream `ordinal` is a text format ffmpeg can convert to ASS (SubtitleTrack renders those).
+    Q_INVOKABLE bool isText(int ordinal) const;
 
     // Exposed for tests.
     static QVector<PgsCue> parseSup(const QByteArray &data);

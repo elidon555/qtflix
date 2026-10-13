@@ -1,12 +1,22 @@
 #pragma once
 #include <QObject>
+#include <QPointer>
 #include <QVector>
 #include <QUrl>
 #include <qqml.h>
 
+class QProcess;
+
 // External subtitle file loader for the player (QML type `SubtitleTrack` in module QtFlix).
 // Supports .srt, .vtt and basic .ass/.ssa (Dialogue lines, tags stripped). Encoding: UTF-8 with
-// fallback to Latin-1. The file is parsed on a worker thread; `valid` turns true when its cues are in.
+// fallback to Latin-1; text that was double-encoded ("trĂ¨s") is repaired. The file is parsed on a worker
+// thread; `valid` turns true when its cues are in.
+//
+// An embedded text track (ass/ssa/subrip/webvtt/mov_text) of a video can be shown instead of a file:
+// set `file` (the video) and `stream` (ordinal among its subtitle streams, -1 = use `source`). The track is
+// copied out with ffmpeg into the cache (background priority) and parsed like any file. This is what Qt
+// Multimedia's own renderer cannot do well: it prints ASS override tags and drops a cue that began before
+// a seek.
 //
 //   SubtitleTrack { id: subs; source: "file:///.../movie.en.srt"; positionMs: player.position }
 //   Text { text: subs.currentText }
@@ -15,6 +25,8 @@ class SubtitleTrack : public QObject
     Q_OBJECT
     QML_ELEMENT
     Q_PROPERTY(QUrl source READ source WRITE setSource NOTIFY sourceChanged FINAL)
+    Q_PROPERTY(QString file READ file WRITE setFile NOTIFY fileChanged FINAL)
+    Q_PROPERTY(int stream READ stream WRITE setStream NOTIFY streamChanged FINAL)
     Q_PROPERTY(qint64 positionMs READ positionMs WRITE setPositionMs NOTIFY positionMsChanged FINAL)
     Q_PROPERTY(qint64 offsetMs READ offsetMs WRITE setOffsetMs NOTIFY offsetMsChanged FINAL)
     Q_PROPERTY(QString currentText READ currentText NOTIFY currentTextChanged FINAL)  // may contain <i>/<b> (Text.RichText safe)
@@ -25,6 +37,10 @@ public:
     explicit SubtitleTrack(QObject *parent = nullptr);
     QUrl source() const { return m_source; }
     void setSource(const QUrl &u);
+    QString file() const { return m_file; }
+    void setFile(const QString &f);
+    int stream() const { return m_stream; }
+    void setStream(int s);
     qint64 positionMs() const { return m_pos; }
     void setPositionMs(qint64 ms);
     qint64 offsetMs() const { return m_offset; }
@@ -34,13 +50,23 @@ public:
     bool valid() const { return !m_cues.isEmpty(); }
 signals:
     void sourceChanged();
+    void fileChanged();
+    void streamChanged();
     void positionMsChanged();
     void offsetMsChanged();
     void currentTextChanged();
     void cuesChanged();
 private:
     void update();
+    void reload();
+    void loadPath(const QString &path, quint64 gen);
+    void extractStream(quint64 gen);
+    void stopExtract();
+    QString cachePath() const;
     QUrl m_source;
+    QString m_file;
+    int m_stream = -1;
+    QPointer<QProcess> m_extract;
     qint64 m_pos = 0, m_offset = 0;
     QString m_current;
     QVector<Cue> m_cues;
