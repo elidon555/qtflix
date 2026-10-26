@@ -196,7 +196,7 @@ Item {
                                 MediaPlayer {
                                     id: player
                                     source: root.t.sourceUrl
-                                    videoOutput: vout
+                                    videoOutput: HdrVideoSink { output: vout }   // fixes Qt's HDR10 tone mapping
                                     audioOutput: AudioOutput { muted: root.muted; volume: 0.7 }
                                     onMediaStatusChanged: {
                                         if ((mediaStatus === MediaPlayer.LoadedMedia || mediaStatus === MediaPlayer.BufferedMedia)

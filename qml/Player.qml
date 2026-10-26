@@ -522,7 +522,7 @@ Rectangle {
     // ---- media -----------------------------------------------------------------------------
     MediaPlayer {
         id: player
-        videoOutput: video
+        videoOutput: HdrVideoSink { output: video }   // fixes Qt's HDR10 tone mapping
         audioOutput: audio
         onMediaStatusChanged: {
             if (mediaStatus === MediaPlayer.LoadedMedia || mediaStatus === MediaPlayer.BufferedMedia)
